@@ -8,7 +8,8 @@
 #   acpi-call      acpi_call-dkms (AUR) + matching kernel headers
 #   switch         /usr/local/bin/applespi-force (UIEN 0 / SIEN 1 / reload applespi) + systemd unit
 #   initramfs      busybox early hook so the keyboard works at the LUKS passphrase prompt
-#   sleep          s2idle drop-in + system-sleep hook (detach applespi + brcmfmac around suspend)
+#   sleep          s2idle drop-in + system-sleep hook (applespi/brcmfmac detach, Wi-Fi slot power-cycle,
+#                  supplicant/NM restart and Omarchy shell refresh after resume)
 #   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset
 #   verify         read-only checks; run this after each reboot
 #
@@ -256,7 +257,17 @@ MemorySleepMode=s2idle
 EOF
   write_file "$SLEEP_HOOK" 755 <<'EOF'
 #!/bin/sh
-# MacBookPro12,1: applespi wedges across sleep; brcmfmac fails to enter D3 (-5) and aborts the suspend.
+# MacBookPro12,1 sleep hook (Omarchy)
+#  pre : detach applespi (wedges across sleep) and brcmfmac (refuses D3 with -5, which aborts suspend)
+#  post: power-cycle the Wi-Fi PCIe slot (BCM43602 comes back dead after hibernate), reload brcmfmac,
+#        restart wpa_supplicant + NetworkManager (they give up on the recreated interface),
+#        refresh the Omarchy shell (its network widget stays bound to the old interface),
+#        then reattach applespi
+WIFI_CLASS=0x028000      # PCI class of the BCM43602 (network controller, other)
+
+wifi_dev() { grep -lx "$WIFI_CLASS" /sys/bus/pci/devices/*/class 2>/dev/null | head -1 | xargs -r dirname; }
+wifi_up()  { ls /sys/class/net 2>/dev/null | grep -q '^wl'; }
+
 case "$1" in
     pre)
         modprobe -r applespi
@@ -264,7 +275,28 @@ case "$1" in
         modprobe -r brcmfmac
         ;;
     post)
+        dev=$(wifi_dev)
+        if [ -n "$dev" ]; then
+            port=$(readlink -f "$dev/..")          # PCIe root port above the card (0000:00:1c.2)
+            echo 1 > "$port/remove"
+            sleep 2
+        fi
+        echo 1 > /sys/bus/pci/rescan
+        sleep 2
         modprobe brcmfmac
+        i=0; while [ $i -lt 10 ] && ! wifi_up; do sleep 1; i=$((i+1)); done
+        systemctl restart wpa_supplicant NetworkManager
+
+        # Refresh the shell as the session user, borrowing the running Quickshell's environment
+        qs_pid=$(pgrep -x quickshell | head -1)
+        if [ -n "$qs_pid" ]; then
+            qs_user=$(stat -c %U "/proc/$qs_pid")
+            qs_env=$(tr '\0' '\n' < "/proc/$qs_pid/environ" \
+                | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|DBUS_SESSION_BUS_ADDRESS|HOME|USER|PATH|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP)=' \
+                | tr '\n' ' ')
+            ( sleep 4; env -i $qs_env runuser -u "$qs_user" -- /usr/bin/omarchy-refresh-shell ) >/dev/null 2>&1 &
+        fi
+
         /usr/local/bin/applespi-force
         ;;
 esac
@@ -366,6 +398,8 @@ phase_verify() {
   chk "hook ran in initrd (acpi_call < 5s)" "sudo dmesg | awk '/acpi_call: loading/{gsub(/[\\[\\]]/,\" \"); f=1; exit !(\$1+0 < 5)} END{if(!f) exit 1}'"
   chk "mem_sleep is s2idle"               "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
   chk "sleep hook executable"             "[[ -x $SLEEP_HOOK ]]"
+  chk "Wi-Fi card visible on PCI (class 0x028000)" "grep -lxq 0x028000 /sys/bus/pci/devices/*/class"
+  chk "omarchy-refresh-shell available"   "command -v omarchy-refresh-shell >/dev/null"
   if [[ -f $RESUME_DROPIN ]]; then
     chk "swap subvolume is top-level @swap" "sudo btrfs subvolume list / | awk -v s=$SWAP_SUBVOL '\$NF==s && \$7==\"5\"{f=1} END{exit !f}'"
     chk "swapfile active with PRIO >= 0"    "swapon --show=NAME,PRIO --noheadings | awk -v f=$SWAP_FILE '\$1==f && \$2>=0{f2=1} END{exit !f2}'"
