@@ -39,6 +39,7 @@ HOOK_INSTALL="/etc/initcpio/install/applespi-force"
 HOOK_RUNTIME="/etc/initcpio/hooks/applespi-force"
 HOOK_CONF="/etc/mkinitcpio.conf.d/zz-applespi-force.conf"
 SLEEP_CONF="/etc/systemd/sleep.conf.d/mac-s2idle.conf"
+HIBERNATE_CONF="/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf"
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/applespi"
 SHELL_REFRESH_SCRIPT="$HOME/.local/bin/shell-refresh-on-resume"
 SHELL_REFRESH_UNIT="$HOME/.config/systemd/user/shell-refresh-on-resume.service"
@@ -379,6 +380,12 @@ phase_hibernation() {
   [[ $(findmnt -no FSTYPE /) == btrfs ]] || die "root is not btrfs"
   ok "root device $root_dev"
 
+  # ACPI S4 ("platform") leaves lid/Wi-Fi/AC wake armed; the Mac powers itself back on and sits at the LUKS prompt
+  write_file "$HIBERNATE_CONF" 644 <<'EOF'
+[Sleep]
+HibernateMode=shutdown
+EOF
+
   local mem_kb size; mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
   size=${SWAP_SIZE:-"$(( (mem_kb + 1048575) / 1048576 + 2 ))g"}; size=${size,,}
   [[ $size =~ ^[0-9]+g$ ]] || die "--swap-size must look like 18g"
@@ -482,6 +489,7 @@ phase_verify() {
     chk "swap subvolume is top-level @swap" "sudo btrfs subvolume list / | awk -v s=$SWAP_SUBVOL '\$NF==s && \$7==\"5\"{f=1} END{exit !f}'"
     chk "swapfile active with PRIO >= 0"    "swapon --show=NAME,PRIO --noheadings | awk -v f=$SWAP_FILE '\$1==f && \$2>=0{f2=1} END{exit !f2}'"
     chk "resume_offset matches swapfile"    "[[ \$(sudo btrfs inspect-internal map-swapfile -r $SWAP_FILE) == \$(grep -oE 'resume_offset=[0-9]+' /proc/cmdline | cut -d= -f2) ]]"
+    chk "hibernate powers off (no S4 wake)" "systemd-analyze cat-config systemd/sleep.conf | grep -qx 'HibernateMode=shutdown'"
     chk "logind CanHibernate = yes"         "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate | grep -q '\"yes\"'"
   else
     warn "hibernation not configured (no $RESUME_DROPIN) — run 'sudo omarchy-hibernation-setup', then --phase hibernation"
