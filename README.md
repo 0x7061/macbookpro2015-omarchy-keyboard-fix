@@ -1,17 +1,6 @@
 # MacBookPro12,1 — built-in keyboard & trackpad on Omarchy (applespi fix)
 
-Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. Compiled 18 Sept 2026.
-
-## Script Use
-```
-./mbp12-omarchy-fix.sh --dry-run        # read the diffs
-./mbp12-omarchy-fix.sh                  # everything except hibernation
-# reboot (USB keyboard attached)
-./mbp12-omarchy-fix.sh --verify
-sudo omarchy-hibernation-setup          # if not already done
-./mbp12-omarchy-fix.sh --phase hibernation
-./mbp12-omarchy-fix.sh --verify && systemctl hibernate
-```
+Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. Compiled 18–20 Sept 2026.
 
 ---
 
@@ -209,10 +198,26 @@ MemorySleepMode=s2idle
 
 ### 6.2 `/usr/lib/systemd/system-sleep/applespi`
 
-Two things must be detached before sleep: `applespi` (wedges otherwise) and the Broadcom Wi-Fi driver `brcmfmac` (fails to enter D3 with `-5`, which aborts the suspend and makes systemd retry in a loop — the "lid logo blinks every few seconds" symptom).
+Four things go wrong around sleep on this machine, all handled in one hook:
+
+1. `applespi` wedges across sleep → unload in `pre`, reload in `post`.
+2. `brcmfmac` refuses to enter D3 (`-5`) → suspend aborts and systemd retries in a loop ("lid logo blinks every few seconds") → unload in `pre`.
+3. After **hibernate** the BCM43602 comes back dead: a plain driver reload leaves `wpa_supplicant` failing with `Failed to initialize driver interface` until NetworkManager gives up ("supplicant interface keeps failing, giving up"). Removing only the endpoint (`03:00.0`) is not enough; the **PCIe root port** above it (`00:1c.2`) must be removed and rescanned (real slot power cycle), then `wpa_supplicant` and `NetworkManager` restarted because they have already given up on the old interface.
+4. The Omarchy shell (Quickshell) keeps its network widget bound to the old interface and shows "NOT CONNECTED" although `nmcli` is connected → `omarchy-refresh-shell`, run as the session user with the session's environment (the hook runs as root without a Wayland session).
 
 ```sh
 #!/bin/sh
+# MacBookPro12,1 sleep hook (Omarchy)
+#  pre : detach applespi (wedges across sleep) and brcmfmac (refuses D3 with -5, which aborts suspend)
+#  post: power-cycle the Wi-Fi PCIe slot (BCM43602 comes back dead after hibernate), reload brcmfmac,
+#        restart wpa_supplicant + NetworkManager (they give up on the recreated interface),
+#        refresh the Omarchy shell (its network widget stays bound to the old interface),
+#        then reattach applespi
+WIFI_CLASS=0x028000      # PCI class of the BCM43602 (network controller, other)
+
+wifi_dev() { grep -lx "$WIFI_CLASS" /sys/bus/pci/devices/*/class 2>/dev/null | head -1 | xargs -r dirname; }
+wifi_up()  { ls /sys/class/net 2>/dev/null | grep -q '^wl'; }
+
 case "$1" in
     pre)
         modprobe -r applespi
@@ -220,20 +225,50 @@ case "$1" in
         modprobe -r brcmfmac
         ;;
     post)
+        dev=$(wifi_dev)
+        if [ -n "$dev" ]; then
+            port=$(readlink -f "$dev/..")          # PCIe root port above the card (0000:00:1c.2)
+            echo 1 > "$port/remove"
+            sleep 2
+        fi
+        echo 1 > /sys/bus/pci/rescan
+        sleep 2
         modprobe brcmfmac
+        i=0; while [ $i -lt 10 ] && ! wifi_up; do sleep 1; i=$((i+1)); done
+        systemctl restart wpa_supplicant NetworkManager
+
+        # Refresh the shell as the session user, borrowing the running Quickshell's environment
+        qs_pid=$(pgrep -x quickshell | head -1)
+        if [ -n "$qs_pid" ]; then
+            qs_user=$(stat -c %U "/proc/$qs_pid")
+            qs_env=$(tr '\0' '\n' < "/proc/$qs_pid/environ" \
+                | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|DBUS_SESSION_BUS_ADDRESS|HOME|USER|PATH|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP)=' \
+                | tr '\n' ' ')
+            ( sleep 4; env -i $qs_env runuser -u "$qs_user" -- /usr/bin/omarchy-refresh-shell ) >/dev/null 2>&1 &
+        fi
+
         /usr/local/bin/applespi-force
         ;;
 esac
 ```
 
-If `modprobe -r brcmfmac` ever reports "in use", add `nmcli radio wifi off` before the unload and `nmcli radio wifi on` after the reload.
-
 ```bash
 sudo chmod 755 /usr/lib/systemd/system-sleep/applespi
-systemctl suspend      # test, then after wake:
+systemctl suspend      # wake → nmcli device status → connected; bar icon correct
+systemctl hibernate    # resume → same
 sudo journalctl -b -o short-monotonic | grep -iE "PM: |brcmfmac|Failed to put" | tail -15
 #   good: one "suspend entry (s2idle)" → "suspend exit", no "returns -5", Wi-Fi re-registers
-nmcli device status    # wifi connected again
+```
+
+Manual recovery if Wi-Fi is ever dead after a resume (same steps the hook performs):
+
+```bash
+sudo modprobe -r brcmfmac
+echo 1 | sudo tee /sys/bus/pci/devices/0000:00:1c.2/remove; sleep 2
+echo 1 | sudo tee /sys/bus/pci/rescan; sleep 2
+sudo modprobe brcmfmac; sleep 3
+sudo systemctl restart wpa_supplicant NetworkManager
+omarchy-refresh-shell
 ```
 
 Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo cat /sys/kernel/debug/wakeup_sources` (event counts), and the journal grep above. If the journal shows `Some devices failed to suspend` / `Failed to put system to sleep`, it is a device refusing to suspend, not a wake source.
@@ -327,7 +362,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `/etc/initcpio/hooks/applespi-force` | early hook: switch to SPI before LUKS prompt |
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
-| `/usr/lib/systemd/system-sleep/applespi` | detach/reattach `applespi` + `brcmfmac` around suspend |
+| `/usr/lib/systemd/system-sleep/applespi` | around sleep: detach/reattach `applespi`; unload `brcmfmac`, root-port power cycle, restart supplicant/NM, refresh shell |
 | `/etc/fstab` | `@swap` subvolume mounted at `/swap` + swapfile with `pri=0` |
 | `/etc/limine-entry-tool.d/resume.conf` | `resume=/dev/mapper/root resume_offset=<from map-swapfile>` (written by Omarchy, offset updated) |
 
@@ -340,6 +375,8 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 - If the ACPI path ever changes, re-read `firmware_node/path` and update the script (4.3) and hook (5.2).
 - Harmless dmesg: `Unknown touchpad model 3 – falling back to MB8 touchpad` (no geometry table for the 12,1); one `crc mismatch` during the mode switch.
 - Trackpad tuning: Super + Space → Setup → Input, or `omarchy-trackpad-plus`.
+- The `rfkill`/`iw` PHY index (`phy0` → `phy3`…) climbs by one on every resume because the card is re-enumerated; harmless.
+- Omarchy 4 tooling lives in `/usr/bin/omarchy-*` (no `~/.local/share/omarchy/bin`); the bar is Quickshell (`quickshell -p /usr/share/omarchy/shell`), `omarchy-bar` is only its config CLI, and `omarchy-refresh-shell` reloads it.
 - `journalctl` for system units needs `sudo`; `/boot` is root-only; the UKI is an `.efi`, readable with `lsinitcpio`.
 
 ---
@@ -355,6 +392,8 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `acpi_call` first loads at ~12 s, keyboard dead at LUKS | hook not in initramfs (drop-in clobbered) | `zz-` drop-in name, rebuild, check for build-hook line |
 | keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
 | lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
+| Wi-Fi dead after hibernate: `wpa_supplicant: Failed to initialize driver interface`, NM `unavailable` then "giving up" | card not really reset by driver reload | root-port remove/rescan + restart `wpa_supplicant NetworkManager` (6.2) |
+| bar shows "NOT CONNECTED" but `nmcli` connected | Quickshell widget bound to old interface | `omarchy-refresh-shell` (automated in 6.2) |
 | `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
 | `resume_offset` wrong after recreating swapfile | offset not recomputed | `btrfs inspect-internal map-swapfile -r`, update resume.conf, `limine-update` |
 
