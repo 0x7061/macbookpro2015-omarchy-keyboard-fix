@@ -4,6 +4,36 @@ Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, ke
 
 ---
 
+## 0. Quick start — `mbp12-omarchy-fix.sh`
+
+Everything in this document is automated by `mbp12-omarchy-fix.sh` (next to this file). It is idempotent (unchanged files are skipped), verifies after each step, stops at the first failure, and backs up every system file it changes to `/root/mbp12-fix-backups/<timestamp>/` (files under `$HOME` get a `.bak.<timestamp>` copy). Run it as your normal user — it calls `sudo` itself; the AUR helper refuses to run as root. The sections below are the manual equivalent and the explanation of *why*.
+
+```bash
+./mbp12-omarchy-fix.sh --dry-run            # show what would be written/run, change nothing
+./mbp12-omarchy-fix.sh                      # all non-destructive phases (everything except hibernation)
+sudo reboot                                 # keep a USB keyboard attached for this first reboot
+./mbp12-omarchy-fix.sh --verify             # read-only checks; run after every reboot / change
+
+sudo omarchy-hibernation-setup              # optional: hibernation (opt-in, recreates the swapfile)
+./mbp12-omarchy-fix.sh --phase hibernation [--yes] [--swap-size 18g]
+```
+
+| Phase (`--phase <name>`) | Does | Section |
+|---|---|---|
+| `kernel-params` | `initcall_blacklist=dw_pci_driver_init mem_sleep_default=s2idle` in `/etc/default/limine`, rebuild | 3 |
+| `acpi-call` | kernel headers + `acpi_call-dkms` (AUR) | 4.1 |
+| `switch` | `/usr/local/bin/applespi-force` + `applespi-force.service` | 4.3–4.4 |
+| `initramfs` | early hook so the keyboard works at the LUKS prompt, rebuild | 5 |
+| `sleep` | s2idle drop-in, sleep hook, `shell-refresh-on-resume` user script + unit | 6 |
+| `hibernation` | **opt-in, destructive for the swapfile:** move it to a top-level `@swap` subvolume, fix `resume_offset` | 7 |
+| `verify` | same as `--verify` | — |
+
+Other flags: `--force-model` skips the `MacBookPro12,1` check (e.g. to try it on a MacBook8,1), `--help` prints the usage header.
+
+After changing the sleep hook or the user unit, `./mbp12-omarchy-fix.sh --phase sleep` re-installs just those files (no reboot needed); then `--verify`.
+
+---
+
 ## 1. Root cause
 
 The topcase (keyboard + trackpad) can be driven over **USB or SPI**; ACPI methods select the interface:
