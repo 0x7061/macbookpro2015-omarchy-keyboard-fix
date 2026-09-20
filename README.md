@@ -458,13 +458,23 @@ The `resume` initramfs hook and `resume=/dev/mapper/root resume_offset=…` kern
 ### 7.3 Test and read the log correctly
 
 ```bash
-systemctl hibernate        # machine powers off; power on → LUKS prompt (built-in keyboard works) → session restored
+systemctl hibernate        # machine powers off; power button → LUKS prompt (built-in keyboard works) → session restored
 sudo journalctl -b -o short-iso --no-pager | grep -iE "hibernation entry|hibernation exit" | tail -2
 ```
 
 A resumed system keeps the *same boot ID* and its log is the memory snapshot taken **before** the image was written, so `journalctl -b -1` is empty and you will not see "Image saving" or "Image restored" lines. Success is: a wall-clock gap of tens of seconds between `hibernation entry` and `hibernation exit` while monotonic time barely moves, followed by `modeswitch done` (the sleep hook's `post` phase) and, a second or two later, `brcmfmac` re-registering (the detached `applespi-wifi-resume` unit). An abort shows a ~1 s gap and an error between the two lines.
 
-### 7.4 Optional: suspend-then-hibernate on lid close
+### 7.4 Power off instead of ACPI S4 (`HibernateMode=shutdown`)
+
+```ini
+# /etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf
+[Sleep]
+HibernateMode=shutdown
+```
+
+The default (`platform shutdown`, `/sys/power/disk` = `[platform]`) enters ACPI S4 after writing the image, and S4 keeps wake sources armed (`/proc/acpi/wakeup`: `LID0` and `ARPT` are S4-capable and enabled; the firmware also reacts to AC events). Observed 20 Sept 2026 on AC power: lid closed 14:38 → hibernate 16:38:39 → found ~3 h later powered on and sitting at the LUKS prompt. The image was intact (entering the passphrase restored the session), so the write had succeeded — the machine just did not stay off. With `shutdown` the kernel does a plain power-off after writing the image: nothing can wake it, and you resume with the power button (opening the lid alone no longer starts it). Takes effect on the next sleep, no restart needed (`systemd-sleep` reads the config each time). The installer's `hibernation` phase writes this file.
+
+### 7.5 Optional: suspend-then-hibernate on lid close
 
 ```ini
 # /etc/systemd/sleep.conf.d/hibernate-delay.conf
@@ -492,6 +502,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `/etc/initcpio/hooks/applespi-force` | early hook: switch to SPI before LUKS prompt |
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
+| `/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` | `HibernateMode=shutdown`: real power-off after hibernate, no S4 wake-ups (7.4) |
 | `/usr/lib/systemd/system-sleep/applespi` | `pre`: detach `applespi` + `brcmfmac`; `post`: reattach `applespi`, spawn detached `applespi-wifi-resume` unit (root-port power cycle; only if NM doesn't recover: restart supplicant/NM + trigger the user unit) |
 | `~/.local/bin/shell-refresh-on-resume` | fallback only: wait for unlock, then `omarchy-restart-shell` |
 | `~/.config/systemd/user/shell-refresh-on-resume.service` | user unit wrapping the script; started by the hook via `systemctl --user --machine=` |
@@ -532,6 +543,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `Refusing to restart Omarchy shell while the session is locked.` | `omarchy-restart-shell` called before unlock | wait on `omarchy-hyprland-session-locked` (6.2) |
 | `modprobe: FATAL: Module brcmfmac is in use` at the s2idle → hibernate transition | `post` → `pre` back-to-back, driver still loading firmware | `pre` stops `applespi-wifi-resume` and retries the unload (6.2) |
 | `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
+| hibernated Mac found powered on at the LUKS prompt | ACPI S4 (`platform` mode) leaves lid/Wi-Fi/AC wake armed | `HibernateMode=shutdown` (7.4) |
 | `resume_offset` wrong after recreating swapfile | offset not recomputed | `btrfs inspect-internal map-swapfile -r`, update resume.conf, `limine-update` |
 
 ---
