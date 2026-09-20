@@ -8,8 +8,9 @@
 #   acpi-call      acpi_call-dkms (AUR) + matching kernel headers
 #   switch         /usr/local/bin/applespi-force (UIEN 0 / SIEN 1 / reload applespi) + systemd unit
 #   initramfs      busybox early hook so the keyboard works at the LUKS passphrase prompt
-#   sleep          s2idle drop-in + system-sleep hook (applespi/brcmfmac detach, Wi-Fi slot power-cycle,
-#                  supplicant/NM restart and Omarchy shell refresh after resume)
+#   sleep          s2idle drop-in + system-sleep hook (applespi/brcmfmac detach; on resume applespi is
+#                  reattached immediately, Wi-Fi slot power-cycle + supplicant/NM restart run detached)
+#                  + user unit that restarts the Omarchy shell once the session is unlocked
 #   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset
 #   verify         read-only checks; run this after each reboot
 #
@@ -23,7 +24,8 @@
 #
 # Run as your normal user (needs sudo; the AUR helper refuses to run as root).
 # Exits non-zero at the first failed step; nothing after a failed step is touched.
-# Backups of every file it modifies go to /root/mbp12-fix-backups/<timestamp>/
+# Backups of every system file it modifies go to /root/mbp12-fix-backups/<timestamp>/
+# (files under $HOME get a .bak.<timestamp> copy next to them)
 # =============================================================================
 set -euo pipefail
 
@@ -38,6 +40,8 @@ HOOK_RUNTIME="/etc/initcpio/hooks/applespi-force"
 HOOK_CONF="/etc/mkinitcpio.conf.d/zz-applespi-force.conf"
 SLEEP_CONF="/etc/systemd/sleep.conf.d/mac-s2idle.conf"
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/applespi"
+SHELL_REFRESH_SCRIPT="$HOME/.local/bin/shell-refresh-on-resume"
+SHELL_REFRESH_UNIT="$HOME/.config/systemd/user/shell-refresh-on-resume.service"
 LIMINE_CONF="/etc/default/limine"
 RESUME_DROPIN="/etc/limine-entry-tool.d/resume.conf"
 OMARCHY_RESUME_CONF="/etc/mkinitcpio.conf.d/omarchy_resume.conf"
@@ -56,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     --force-model) FORCE_MODEL=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
     --swap-size) SWAP_SIZE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -104,6 +108,23 @@ write_file() {
   else
     backup "$path"
     sudo install -D -m "$mode" "$tmp" "$path"
+    ok "wrote $path"
+  fi
+  rm -f "$tmp"; CHANGED=1
+}
+# write_user_file <path> <mode> <<content ; same as write_file but unprivileged (files under $HOME)
+write_user_file() {
+  local path="$1" mode="$2" tmp
+  tmp=$(mktemp); cat > "$tmp"
+  if [[ -e $path ]] && cmp -s "$tmp" "$path" && [[ $(stat -c %a "$path") == "$mode" ]]; then
+    ok "$path up to date"; rm -f "$tmp"; return 0
+  fi
+  if (( DRY_RUN )); then
+    echo "  [dry-run] would write $path (mode $mode):"
+    if [[ -e $path ]]; then diff -u "$path" "$tmp" | sed 's/^/      /' || true; else sed 's/^/      | /' "$tmp"; fi
+  else
+    [[ -e $path ]] && cp -a "$path" "$path.bak.$(date +%Y%m%d-%H%M%S)"
+    install -D -m "$mode" "$tmp" "$path"
     ok "wrote $path"
   fi
   rm -f "$tmp"; CHANGED=1
@@ -259,48 +280,93 @@ EOF
 #!/bin/sh
 # MacBookPro12,1 sleep hook (Omarchy)
 #  pre : detach applespi (wedges across sleep) and brcmfmac (refuses D3 with -5, which aborts suspend)
-#  post: power-cycle the Wi-Fi PCIe slot (BCM43602 comes back dead after hibernate), reload brcmfmac,
-#        restart wpa_supplicant + NetworkManager (they give up on the recreated interface),
-#        refresh the Omarchy shell (its network widget stays bound to the old interface),
-#        then reattach applespi
+#  post: reattach applespi right away, then hand the slow Wi-Fi recovery to a detached unit.
+#        user.slice (and with it the lock screen) stays frozen until this hook returns, so
+#        nothing slow may run here or keyboard/trackpad/lock screen are dead for seconds.
+#  wifi-resume (run detached via systemd-run): power-cycle the Wi-Fi PCIe slot (BCM43602 comes
+#        back dead after hibernate) and reload brcmfmac. NetworkManager normally treats that as a
+#        hot-plug and reconnects by itself; the bar follows along. Only if NM does not get a working
+#        supplicant interface: restart wpa_supplicant + NetworkManager, which in turn requires
+#        restarting the Omarchy shell (Quickshell's network model does not survive an NM restart,
+#        and the restart flickers the whole screen - hence last resort)
 WIFI_CLASS=0x028000      # PCI class of the BCM43602 (network controller, other)
+WIFI_UNIT=applespi-wifi-resume
 
 wifi_dev() { grep -lx "$WIFI_CLASS" /sys/bus/pci/devices/*/class 2>/dev/null | head -1 | xargs -r dirname; }
 wifi_up()  { ls /sys/class/net 2>/dev/null | grep -q '^wl'; }
+# NM keeps a Wi-Fi device "unavailable" until wpa_supplicant has a working interface for it
+nm_wifi_ok() { nmcli -t -f TYPE,STATE device 2>/dev/null | grep -qE '^wifi:(disconnected|connecting|connected|need-auth)'; }
 
 case "$1" in
     pre)
+        # suspend-then-hibernate runs post -> pre within 300 ms at the s2idle -> hibernate transition;
+        # don't race a running recovery
+        systemctl stop "$WIFI_UNIT.service" 2>/dev/null
         modprobe -r applespi
-        modprobe -r brcmfmac_wcc 2>/dev/null
-        modprobe -r brcmfmac
+        # brcmfmac is "in use" while its firmware is still loading (rescan autoloads it), so retry briefly
+        i=0
+        until { modprobe -r brcmfmac_wcc; modprobe -r brcmfmac; } 2>/dev/null || [ $i -ge 25 ]; do
+            sleep 0.2; i=$((i+1))
+        done
         ;;
     post)
+        /usr/local/bin/applespi-force
+        systemd-run --quiet --collect --no-block --unit="$WIFI_UNIT" "$0" wifi-resume
+        ;;
+    wifi-resume)
         dev=$(wifi_dev)
         if [ -n "$dev" ]; then
             port=$(readlink -f "$dev/..")          # PCIe root port above the card (0000:00:1c.2)
             echo 1 > "$port/remove"
-            sleep 2
+            sleep 1
         fi
         echo 1 > /sys/bus/pci/rescan
-        sleep 2
         modprobe brcmfmac
-        i=0; while [ $i -lt 10 ] && ! wifi_up; do sleep 1; i=$((i+1)); done
+        # firmware load takes ~1s; poll instead of sleeping, then let udev finish the wlan0 -> wlp3s0 rename
+        i=0; while [ $i -lt 60 ] && ! wifi_up; do sleep 0.2; i=$((i+1)); done
+        udevadm settle -t 3
+
+        i=0; while [ $i -lt 40 ] && ! nm_wifi_ok; do sleep 0.2; i=$((i+1)); done
+        if nm_wifi_ok; then
+            echo "NetworkManager picked up the re-created Wi-Fi interface; no restart needed"
+            exit 0
+        fi
+
+        echo "NetworkManager did not recover the Wi-Fi interface; restarting wpa_supplicant + NetworkManager"
         systemctl restart wpa_supplicant NetworkManager
 
-        # Refresh the shell as the session user, borrowing the running Quickshell's environment
+        # The user unit waits for the unlock itself (omarchy-restart-shell refuses while locked)
         qs_pid=$(pgrep -x quickshell | head -1)
         if [ -n "$qs_pid" ]; then
             qs_user=$(stat -c %U "/proc/$qs_pid")
-            qs_env=$(tr '\0' '\n' < "/proc/$qs_pid/environ" \
-                | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|DBUS_SESSION_BUS_ADDRESS|HOME|USER|PATH|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP)=' \
-                | tr '\n' ' ')
-            ( sleep 4; env -i $qs_env runuser -u "$qs_user" -- /usr/bin/omarchy-refresh-shell ) >/dev/null 2>&1 &
+            systemctl --user --machine="$qs_user@.host" start --no-block shell-refresh-on-resume.service
         fi
-
-        /usr/local/bin/applespi-force
         ;;
 esac
 EOF
+  # user side: the hook starts this unit in the session user's manager once NetworkManager is back
+  write_user_file "$SHELL_REFRESH_SCRIPT" 755 <<'EOF'
+#!/bin/bash
+# Started by /usr/lib/systemd/system-sleep/applespi after resume, once NetworkManager is back.
+# NetworkManager gets restarted there, which leaves the Omarchy shell's network
+# widget bound to the dead NM instance, so the shell has to be restarted.
+# omarchy-restart-shell refuses to run while the session is locked, so wait
+# for the unlock first (exit 0 = locked, 1 = unlocked, 2 = undetermined).
+# No need to wait for connectivity: the fresh shell tracks the new NM live.
+
+while omarchy-hyprland-session-locked; do sleep 0.2; done
+
+exec omarchy-restart-shell
+EOF
+  write_user_file "$SHELL_REFRESH_UNIT" 644 <<'EOF'
+[Unit]
+Description=Restart Omarchy shell after resume (NetworkManager restarted, Wi-Fi interface recreated)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/shell-refresh-on-resume
+EOF
+  if (( DRY_RUN )); then echo "  [dry-run] systemctl --user daemon-reload"; else systemctl --user daemon-reload; fi
   local ms; ms=$(cat /sys/power/mem_sleep 2>/dev/null || true)
   [[ $ms == *"[s2idle]"* ]] && ok "mem_sleep: $ms" || warn "mem_sleep is '$ms' — becomes [s2idle] after reboot"
 }
@@ -387,19 +453,31 @@ phase_verify() {
   step "Verify (read-only)"
   local fail=0
   chk() { if eval "$2"; then ok "$1"; else echo "${C_ERR}  ✗${C_RST} $1"; fail=1; fi; }
+  # Kernel log of this boot from the journal: dmesg is a ring buffer and loses the boot-time lines after
+  # a day or a few suspend cycles; the journal keeps them (also across hibernation: same boot ID).
+  # Dumped to a file because `journalctl | grep -q` dies of SIGPIPE under `set -o pipefail` on an early match.
+  local klog; klog=$(mktemp)
+  sudo journalctl -k -b -o cat --no-pager > "$klog"
   for p in "${KPARAMS[@]}"; do chk "cmdline has $p" "kernel_has $p"; done
-  chk "SPI controller in PIO mode"        "sudo dmesg | grep -q 'no DMA channels available, using PIO'"
+  chk "SPI controller in PIO mode"        "grep -q 'no DMA channels available, using PIO' $klog"
   chk "acpi_call module available"        "modinfo acpi_call >/dev/null 2>&1"
   chk "switch script executable"          "[[ -x $SWITCH_SCRIPT ]]"
   chk "applespi-force.service enabled"    "systemctl is-enabled -q applespi-force.service"
-  chk "applespi modeswitch done"          "sudo dmesg | grep -i applespi | grep -q 'modeswitch done'"
-  chk "no applespi -110 timeouts"         "! sudo dmesg | grep -q 'applespi.*-110'"
+  chk "applespi modeswitch done"          "grep -qi 'applespi.*modeswitch done' $klog"
+  chk "no applespi -110 timeouts"         "! grep -q 'applespi.*-110' $klog"
   chk "initramfs hook files present"      "[[ -f $HOOK_INSTALL && -f $HOOK_RUNTIME && -f $HOOK_CONF ]]"
-  chk "hook ran in initrd (acpi_call < 5s)" "sudo dmesg | awk '/acpi_call: loading/{gsub(/[\\[\\]]/,\" \"); f=1; exit !(\$1+0 < 5)} END{if(!f) exit 1}'"
+  # early-boot journal timestamps are all the journald start time, so compare order instead:
+  # acpi_call must load before the root filesystem is mounted (= inside the initramfs, before the LUKS prompt)
+  chk "hook ran in initrd (acpi_call before root mount)" "awk '/acpi_call: loading/{if(!a)a=NR} /BTRFS info .*first mount of filesystem/{if(!b)b=NR} END{exit !(a && b && a<b)}' $klog"
   chk "mem_sleep is s2idle"               "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
   chk "sleep hook executable"             "[[ -x $SLEEP_HOOK ]]"
   chk "Wi-Fi card visible on PCI (class 0x028000)" "grep -lxq 0x028000 /sys/bus/pci/devices/*/class"
-  chk "omarchy-refresh-shell available"   "command -v omarchy-refresh-shell >/dev/null"
+  chk "sleep hook is the detached-recovery version" "grep -q 'wifi-resume)' $SLEEP_HOOK"
+  chk "shell-refresh script executable"   "[[ -x $SHELL_REFRESH_SCRIPT ]]"
+  chk "shell-refresh user unit loaded"    "[[ \$(systemctl --user show -p LoadState --value shell-refresh-on-resume.service) == loaded ]]"
+  chk "omarchy-restart-shell available"   "command -v omarchy-restart-shell >/dev/null"
+  chk "omarchy-hyprland-session-locked available" "command -v omarchy-hyprland-session-locked >/dev/null"
+  chk "last Wi-Fi recovery did not fail"  "! systemctl is-failed -q applespi-wifi-resume.service"
   if [[ -f $RESUME_DROPIN ]]; then
     chk "swap subvolume is top-level @swap" "sudo btrfs subvolume list / | awk -v s=$SWAP_SUBVOL '\$NF==s && \$7==\"5\"{f=1} END{exit !f}'"
     chk "swapfile active with PRIO >= 0"    "swapon --show=NAME,PRIO --noheadings | awk -v f=$SWAP_FILE '\$1==f && \$2>=0{f2=1} END{exit !f2}'"
@@ -408,6 +486,7 @@ phase_verify() {
   else
     warn "hibernation not configured (no $RESUME_DROPIN) — run 'sudo omarchy-hibernation-setup', then --phase hibernation"
   fi
+  rm -f "$klog"
   (( fail )) && { warn "some checks failed — if you have not rebooted since the last change, reboot and re-run --verify"; return 1; }
   ok "all checks passed"
 }
@@ -415,7 +494,7 @@ phase_verify() {
 # ============================================================================= main
 (( DRY_RUN )) && warn "DRY RUN — nothing will be changed"
 phase_preflight
-if (( VERIFY_ONLY )); then phase_verify; exit $?; fi
+if (( VERIFY_ONLY )); then phase_verify && exit 0 || exit 1; fi
 
 case "$PHASE" in
   all)          phase_kernel_params; phase_acpi_call; phase_switch; phase_initramfs; phase_sleep; phase_rebuild ;;
@@ -425,7 +504,7 @@ case "$PHASE" in
   initramfs)    phase_initramfs; phase_rebuild ;;
   sleep)        phase_sleep ;;
   hibernation)  phase_hibernation; phase_rebuild ;;
-  verify)       phase_verify; exit $? ;;
+  verify)       phase_verify && exit 0 || exit 1 ;;
   *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|verify)" ;;
 esac
 
