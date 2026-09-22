@@ -380,7 +380,9 @@ phase_hibernation() {
   [[ $(findmnt -no FSTYPE /) == btrfs ]] || die "root is not btrfs"
   ok "root device $root_dev"
 
-  # ACPI S4 ("platform") leaves lid/Wi-Fi/AC wake armed; the Mac powers itself back on and sits at the LUKS prompt
+  # ACPI S4 ("platform") leaves lid/Wi-Fi/AC wake armed; "shutdown" is a plain power-off after the
+  # image write (README 7.4). If the Mac still powers itself back on to the LUKS prompt after
+  # hibernate, that is SMC state, not a wake source: do an SMC reset (README 7.5).
   write_file "$HIBERNATE_CONF" 644 <<'EOF'
 [Sleep]
 HibernateMode=shutdown
@@ -489,7 +491,7 @@ phase_verify() {
     chk "swap subvolume is top-level @swap" "sudo btrfs subvolume list / | awk -v s=$SWAP_SUBVOL '\$NF==s && \$7==\"5\"{f=1} END{exit !f}'"
     chk "swapfile active with PRIO >= 0"    "swapon --show=NAME,PRIO --noheadings | awk -v f=$SWAP_FILE '\$1==f && \$2>=0{f2=1} END{exit !f2}'"
     chk "resume_offset matches swapfile"    "[[ \$(sudo btrfs inspect-internal map-swapfile -r $SWAP_FILE) == \$(grep -oE 'resume_offset=[0-9]+' /proc/cmdline | cut -d= -f2) ]]"
-    chk "hibernate powers off (no S4 wake)" "systemd-analyze cat-config systemd/sleep.conf | grep -qx 'HibernateMode=shutdown'"
+    chk "HibernateMode=shutdown (no ACPI S4)" "systemd-analyze cat-config systemd/sleep.conf | grep -qx 'HibernateMode=shutdown'"
     chk "logind CanHibernate = yes"         "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate | grep -q '\"yes\"'"
   else
     warn "hibernation not configured (no $RESUME_DROPIN) — run 'sudo omarchy-hibernation-setup', then --phase hibernation"
