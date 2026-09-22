@@ -1,6 +1,6 @@
 # MacBookPro12,1 — built-in keyboard & trackpad on Omarchy (applespi fix)
 
-Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. Compiled 18–22 Sept 2026; sleep hook reworked 20 Sept 2026 (section 6.2): instant keyboard after resume, detached Wi-Fi recovery, NetworkManager/shell restart only as fallback. Hibernate "does not stay off" solved by an SMC reset on 22 Sept 2026 (section 7.5).
+Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. State as of 22 Sept 2026.
 
 ---
 
@@ -228,15 +228,17 @@ MemorySleepMode=s2idle
 
 ### 6.2 Sleep hook + shell-restart user unit
 
-Five things go wrong around sleep on this machine:
+Constraints the hook is built around:
 
 1. `applespi` wedges across sleep → unload in `pre`, reload in `post`.
-2. `brcmfmac` refuses to enter D3 (`-5`) → suspend aborts and systemd retries in a loop ("lid logo blinks every few seconds") → unload in `pre`.
-3. After **hibernate** the BCM43602 comes back dead: a plain driver reload leaves `wpa_supplicant` failing with `Failed to initialize driver interface` until NetworkManager gives up ("supplicant interface keeps failing, giving up"). Removing only the endpoint (`03:00.0`) is not enough; the **PCIe root port** above it (`00:1c.2`) must be removed and rescanned (real slot power cycle), then `wpa_supplicant` and `NetworkManager` restarted because they have already given up on the old interface.
-4. The Omarchy shell (Quickshell, `Quickshell.Networking` → NetworkManager D-Bus) loses track once NetworkManager is **restarted** and shows "NOT CONNECTED" although `nmcli` is connected; only a full shell restart (in the user session, after the unlock; flickers the whole screen) fixes that → avoid restarting NetworkManager at all, keep restart + shell restart as a fallback.
-5. systemd keeps `user.slice` — including the lock screen — **frozen until every sleep hook has returned**. Anything slow in `post` means dead keyboard/trackpad/lock screen for that long.
+2. `brcmfmac` refuses to enter D3 (`-5`), which aborts the suspend and makes systemd retry in a loop (lid logo blinks every few seconds) → unload in `pre`.
+3. After hibernate the BCM43602 comes back dead. A driver reload is not enough: the PCIe root port above it (`00:1c.2`, found via PCI class `0x028000`) must be removed and rescanned. NetworkManager then sees a hot-plug and reconnects on its own.
+4. Restarting NetworkManager breaks the Omarchy shell's network widget (Quickshell's `Quickshell.Networking` D-Bus model does not re-attach; the bar shows "NOT CONNECTED" while `nmcli` is connected). The only repair is `omarchy-restart-shell`, which flickers the screen and refuses to run while the session is locked → restart NM + shell only as a fallback, and only after the unlock.
+5. systemd keeps `user.slice`, including the lock screen, frozen until every sleep hook has returned → `post` does nothing slow; the Wi-Fi recovery runs detached via `systemd-run` (a `&` background job would be killed with `systemd-sleep`).
+6. `suspend-then-hibernate` runs `post` → `pre` within ~300 ms at the s2idle → hibernate transition → `pre` stops a running Wi-Fi recovery and retries the `brcmfmac` unload (the module is "in use" while its firmware loads).
+7. The shell restart runs as a user unit started with `systemctl --user --machine=<user>@.host`, because the user manager already carries the Hyprland environment. `omarchy-restart-shell`, not `omarchy-refresh-shell` (the latter resets `~/.config/omarchy/shell.json` to defaults first).
 
-Design that follows from this (three pieces):
+Resulting design (three pieces):
 
 ```
 systemd-sleep ─post─▶ hook "post":  applespi-force                       keyboard back ~30 ms after resume
@@ -245,7 +247,7 @@ systemd-sleep ─post─▶ hook "post":  applespi-force                       k
 
 applespi-wifi-resume.service (root): remove root port → rescan → modprobe brcmfmac → poll for wl* → udevadm settle
                                      → wait ≤ 8 s for NM to report the Wi-Fi device as usable (not "unavailable")
-                                       ├─ yes (normal): done. NM saw a hot-plug, reconnects itself, bar icon follows. No flicker.
+                                       ├─ yes (normal): done. NM reconnects itself, bar icon follows. No flicker.
                                        └─ no (fallback): restart wpa_supplicant NetworkManager
                                                          → systemctl --user --machine=<user>@.host start shell-refresh-on-resume.service
 
@@ -354,56 +356,26 @@ ExecStart=%h/.local/bin/shell-refresh-on-resume
 sudo chmod 755 /usr/lib/systemd/system-sleep/applespi
 chmod 755 ~/.local/bin/shell-refresh-on-resume
 systemctl --user daemon-reload
-systemctl suspend      # wake → keyboard works at once on the lock screen; Wi-Fi reconnects by itself within a few seconds; bar icon follows, no flicker
+systemctl suspend      # wake → keyboard works at once on the lock screen; Wi-Fi reconnects by itself within a few seconds
 systemctl hibernate    # resume → same
-sudo journalctl -b -o short-monotonic | grep -iE "PM: |brcmfmac|Failed to put" | tail -15
-#   good: one "suspend entry (s2idle)" → "suspend exit", no "returns -5", Wi-Fi re-registers
 ```
 
-Timeline of the last resume / per-piece logs:
+Logs:
 
 ```bash
-sudo journalctl -b -o short-precise | grep -E 'PM: suspend exit|bitmaps freed|modeswitch done|applespi-wifi-resume|Started Network Manager\.|unlocked|Restart Omarchy' | tail -20
-sudo journalctl -b -u applespi-wifi-resume              # Wi-Fi recovery
-journalctl -b --user-unit shell-refresh-on-resume       # shell restart
+sudo journalctl -b -o short-monotonic | grep -iE "PM: |brcmfmac|Failed to put" | tail -15   # good: one "suspend entry (s2idle)" → "suspend exit", no "returns -5"
+sudo journalctl -b -u applespi-wifi-resume              # which path the Wi-Fi recovery took ("no restart needed" = normal)
+journalctl -b --user-unit shell-refresh-on-resume       # shell restart (fallback only)
 sudo journalctl -b -t systemd-sleep                     # hook errors
 ```
 
-Reference, fallback path (hibernate, 20 Sept 2026): resume 10:41:02.25 → `modeswitch done` :02.62 → NM restarted :06.18 → shell restarted :07.11 → `CONNECTED_GLOBAL` :09.95. Normal path (confirmed on suspend and hibernate the same day): the unit logs `NetworkManager picked up the re-created Wi-Fi interface; no restart needed` and neither NM nor the shell is restarted.
+Tunable: `sleep 1` after removing the root port. If Wi-Fi ever stays dead after hibernate, raise it to `sleep 2`; it only delays Wi-Fi, not input.
 
-#### Why the NM/shell restart is only a fallback
+Manual Wi-Fi recovery (same steps as the hook, including the shell restart): `sudo /usr/lib/systemd/system-sleep/applespi wifi-resume`.
 
-The bar's network icon comes from Quickshell's native `Quickshell.Networking` model (NetworkManager over D-Bus), not from polling — there is no IPC call that refreshes it, and the model does not re-attach when NetworkManager itself is restarted. So *every* NM restart forces a full `omarchy-restart-shell`, which flickers the whole screen. Since `pre` unloads `brcmfmac` and `wifi-resume` re-creates the card from scratch, NetworkManager normally just sees an unplug/re-plug and handles it; the unconditional restart of the first versions was a leftover from before the root-port power cycle existed. `sudo journalctl -b -u applespi-wifi-resume` shows which path each resume took.
+Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo cat /sys/kernel/debug/wakeup_sources` (event counts), and the journal grep above. `Some devices failed to suspend` / `Failed to put system to sleep` means a device refusing to suspend, not a wake source.
 
-#### Pitfalls found the hard way (don't reintroduce)
-
-- **Nothing slow in `post`.** The first version did the whole Wi-Fi recovery inline in `post` and reattached `applespi` last: keyboard, trackpad and lock screen were dead for ~5 s after every resume.
-- **No `( … ) &` background jobs in a sleep hook.** They live in `systemd-suspend.service`'s cgroup and are killed the moment `systemd-sleep` exits — the first version's `( sleep 4; … omarchy-refresh-shell ) &` never ran once. Use `systemd-run` so PID 1 owns the work.
-- **`omarchy-restart-shell` refuses to run while the session is locked** (it would kill the lock screen), and right after resume the session *is* locked → the user unit polls `omarchy-hyprland-session-locked` first.
-- **Run the shell restart as a user unit, not via `runuser`/`env -i`.** The user manager already carries the Hyprland environment (`WAYLAND_DISPLAY`, `HYPRLAND_INSTANCE_SIGNATURE`, `OMARCHY_PATH`); the hand-picked `env -i` list dropped `OMARCHY_PATH`.
-- **`omarchy-restart-shell`, not `omarchy-refresh-shell`.** Refresh = *reset `~/.config/omarchy/shell.json` to the Omarchy defaults*, then restart. Restart is all that is needed.
-- **Don't wait for connectivity (`nm-online`) before restarting the shell.** The fresh shell tracks the new NetworkManager live; waiting only cost ~3.5 s.
-- **suspend-then-hibernate runs `post` → `pre` within ~300 ms** at the s2idle → hibernate transition (the hooks run around *each* of the two sleep operations). `pre` therefore stops `applespi-wifi-resume` first and retries `modprobe -r brcmfmac` for up to 5 s — a half-initialised driver (firmware still loading) reports `Module brcmfmac is in use`.
-- The root port is found via the card's PCI class (`0x028000`), not a hard-coded address.
-
-Tunable: `sleep 1` after removing the root port. If Wi-Fi ever stays dead after **hibernate**, raise it to `sleep 2` — it no longer blocks input, only delays Wi-Fi.
-
-Manual recovery if Wi-Fi is ever dead after a resume (same steps the hook performs):
-
-```bash
-sudo modprobe -r brcmfmac
-echo 1 | sudo tee /sys/bus/pci/devices/0000:00:1c.2/remove; sleep 2
-echo 1 | sudo tee /sys/bus/pci/rescan; sleep 2
-sudo modprobe brcmfmac; sleep 3
-sudo systemctl restart wpa_supplicant NetworkManager
-omarchy-restart-shell
-```
-
-Or simply: `sudo /usr/lib/systemd/system-sleep/applespi wifi-resume` (runs exactly the hook's recovery, including the shell restart).
-
-Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo cat /sys/kernel/debug/wakeup_sources` (event counts), and the journal grep above. If the journal shows `Some devices failed to suspend` / `Failed to put system to sleep`, it is a device refusing to suspend, not a wake source.
-
-Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or set up hibernation (needs a disk-backed swapfile with non-negative priority; zram alone won't hibernate — see the matthiasjg gist for suspend-then-hibernate).
+Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or use hibernation (section 7; needs a disk-backed swapfile with non-negative priority, zram alone won't hibernate).
 
 ---
 
@@ -462,7 +434,7 @@ systemctl hibernate        # machine powers off; power button → LUKS prompt (b
 sudo journalctl -b -o short-iso --no-pager | grep -iE "hibernation entry|hibernation exit" | tail -2
 ```
 
-A resumed system keeps the *same boot ID* and its log is the memory snapshot taken **before** the image was written, so `journalctl -b -1` is empty and you will not see "Image saving" or "Image restored" lines. Success is: a wall-clock gap of tens of seconds between `hibernation entry` and `hibernation exit` while monotonic time barely moves, followed by `modeswitch done` (the sleep hook's `post` phase) and, a second or two later, `brcmfmac` re-registering (the detached `applespi-wifi-resume` unit). An abort shows a ~1 s gap and an error between the two lines.
+A resumed system keeps the same boot ID, and its journal is the snapshot taken *before* the image was written: `journalctl -b -1` is empty and there are no "Image saving/restored" lines. Success = a wall-clock gap of tens of seconds between `hibernation entry` and `hibernation exit` with monotonic time barely moving, then `modeswitch done` and `brcmfmac` re-registering. An abort = ~1 s gap with an error in between.
 
 ### 7.4 `HibernateMode=shutdown` (power off instead of ACPI S4)
 
@@ -476,11 +448,11 @@ The default (`platform`) enters ACPI S4 after writing the image, which keeps wak
 
 ### 7.5 Mac does not stay off after hibernate → SMC reset
 
-Symptom: the image is written fine, but the machine is later found powered on at the LUKS prompt (Apple logo lit with the lid shut). When it happens, it restarts itself within about a minute of the power-off; otherwise it stays off indefinitely. Entering the passphrase restores the session, so hibernation itself was never the problem. It happened on roughly every second cycle, on direct `systemctl hibernate` and on `suspend-then-hibernate` alike, and neither `HibernateMode=shutdown` nor disabling device wake sources changed that.
+Symptom: the image is written fine, but the machine restarts itself within about a minute of the power-off and is found at the LUKS prompt (Apple logo lit with the lid shut). Entering the passphrase restores the session, so hibernation itself is not the problem. Not caused by ACPI wake sources or the sleep path.
 
 **Fix: SMC reset** (22 Sept 2026). Shut down, hold left Shift + Control + Option together with the power button for 10 s, release, then power on. Every hibernate since has stayed off. If it ever comes back, the next step is an NVRAM reset (Cmd + Option + P + R held through two chimes).
 
-To test a cycle: `sudo systemctl hibernate`, then touch nothing for 2 minutes and watch. Back at the LUKS prompt by itself = failure; still dark = good, press power and unlock. The kernel snapshot is taken *before* the image is written, so the power-off is never logged; the entry→resume gap that `mbp-hib-report` (`~/.local/bin`) prints only measures time until someone typed the passphrase, not time off. Only watched cycles count.
+To test a cycle: `sudo systemctl hibernate`, touch nothing for 2 minutes and watch. Back at the LUKS prompt by itself = failure; still dark = good. The power-off is never logged (see 7.3), so only watched cycles count; `mbp-hib-report` (`~/.local/bin`) lists the cycles of the current boot with their entry→resume gap.
 
 ### 7.6 Optional: suspend-then-hibernate on lid close
 
@@ -495,7 +467,7 @@ HandleLidSwitch=suspend-then-hibernate
 HandleLidSwitchExternalPower=suspend-then-hibernate
 ```
 
-`sudo systemctl restart systemd-logind` (logs you out) or reboot. The sleep hooks run around **both** sleep operations: `pre` → s2idle → `post` → (RTC wake after `HibernateDelaySec`) → `pre` again within ~300 ms → hibernate → `post`. The hook's `pre` is written for that (stops a running Wi-Fi recovery, retries the `brcmfmac` unload — see 6.2 pitfalls). Observed with the old hook: `modprobe: FATAL: Module brcmfmac is in use` at the transition. `use_acpi_alarm` lets the timer fire while asleep; on this machine it is already on without being set anywhere (`cat /sys/module/rtc_cmos/parameters/use_acpi_alarm` → `Y`, and it is **not** on the kernel cmdline or in `/etc/modprobe.d/` — the driver enables it itself). Only add `rtc_cmos.use_acpi_alarm=1` if that file reads `N`.
+`sudo systemctl restart systemd-logind` (logs you out) or reboot. The sleep hooks run around **both** sleep operations: `pre` → s2idle → `post` → (RTC wake after `HibernateDelaySec`) → `pre` again within ~300 ms → hibernate → `post`; the hook's `pre` handles that (6.2). The RTC wake needs `cat /sys/module/rtc_cmos/parameters/use_acpi_alarm` → `Y`; on this machine the driver enables it by itself. Only add `rtc_cmos.use_acpi_alarm=1` to the cmdline if it reads `N`.
 
 ---
 
@@ -527,8 +499,8 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 - Harmless dmesg: `Unknown touchpad model 3 – falling back to MB8 touchpad` (no geometry table for the 12,1); one `crc mismatch` during the mode switch.
 - Trackpad tuning: Super + Space → Setup → Input, or `omarchy-trackpad-plus`.
 - The `rfkill`/`iw` PHY index (`phy0` → `phy3`…) climbs by one on every resume because the card is re-enumerated; harmless.
-- Omarchy 4 tooling lives in `/usr/bin/omarchy-*` (no `~/.local/share/omarchy/bin`); the bar is Quickshell (`quickshell -p /usr/share/omarchy/shell`), `omarchy-bar` is only its config CLI. `omarchy-restart-shell` restarts it (refuses while locked); `omarchy-refresh-shell` additionally **resets `~/.config/omarchy/shell.json` to defaults** first — don't automate that one.
-- `dmesg` is a ring buffer: after a day of uptime or a few suspend cycles the boot-time lines (`using PIO`, `acpi_call: loading`) are gone, so the `dmesg | grep` checks in sections 3–5 only work shortly after boot. Later use `sudo journalctl -k -b | grep …` (the journal keeps the whole boot, also across hibernation). Early-boot lines in the journal all carry the journald start time (~8.6 s here), so judge the initramfs hook by **order** — `acpi_call: loading` must come before `BTRFS info … first mount of filesystem` — not by timestamp. `--verify` does exactly that.
+- The bar is Quickshell (`quickshell -p /usr/share/omarchy/shell`); `omarchy-restart-shell` restarts it (refuses while locked). `omarchy-refresh-shell` also resets `~/.config/omarchy/shell.json` to defaults; don't automate that one.
+- The `dmesg | grep` checks in sections 3–5 only work shortly after boot (ring buffer). Later use `sudo journalctl -k -b | grep …`; early-boot lines there all carry the journald start time, so judge the initramfs hook by order (`acpi_call: loading` before `BTRFS info … first mount`), which is what `--verify` does.
 - `journalctl` for system units needs `sudo`; `/boot` is root-only; the UKI is an `.efi`, readable with `lsinitcpio`.
 
 ---
@@ -545,10 +517,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
 | lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
 | Wi-Fi dead after hibernate: `wpa_supplicant: Failed to initialize driver interface`, NM `unavailable` then "giving up" | card not really reset by driver reload | root-port remove/rescan + restart `wpa_supplicant NetworkManager` (6.2) |
-| bar shows "NOT CONNECTED" but `nmcli` connected | Quickshell network widget lost NetworkManager when it was restarted | normally avoided by not restarting NM (6.2); fallback is `omarchy-restart-shell` (automated). If the icon is wrong anyway: `journalctl -b --user-unit shell-refresh-on-resume`, `sudo journalctl -b -u applespi-wifi-resume` |
-| keyboard/trackpad/lock screen dead for several seconds after resume | slow work inside the sleep hook's `post` (user.slice stays frozen until hooks return) | keep `post` minimal, detach the rest with `systemd-run` (6.2) |
-| shell restart after resume never happens, nothing in the logs | it was a `&` background job of the hook → killed when `systemd-sleep` exits | user unit started from a `systemd-run` unit (6.2) |
-| `Refusing to restart Omarchy shell while the session is locked.` | `omarchy-restart-shell` called before unlock | wait on `omarchy-hyprland-session-locked` (6.2) |
+| bar shows "NOT CONNECTED" but `nmcli` connected | Quickshell network widget lost NetworkManager when it was restarted | `omarchy-restart-shell` (automated as fallback, 6.2); check `sudo journalctl -b -u applespi-wifi-resume` |
 | `modprobe: FATAL: Module brcmfmac is in use` at the s2idle → hibernate transition | `post` → `pre` back-to-back, driver still loading firmware | `pre` stops `applespi-wifi-resume` and retries the unload (6.2) |
 | `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
 | hibernated Mac found powered on at the LUKS prompt (Apple logo lit with the lid shut) | power-off after the image write did not stick (SMC state, not a wake source or the sleep path) | SMC reset (7.5); NVRAM reset if it recurs |
