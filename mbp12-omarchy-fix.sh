@@ -33,6 +33,7 @@ set -euo pipefail
 EXPECTED_MODEL="MacBookPro12,1"
 KPARAMS=("initcall_blacklist=dw_pci_driver_init" "mem_sleep_default=s2idle")
 SPI_NODE="/sys/bus/spi/devices/spi-APP000D:00"
+USB_PORT="/sys/bus/usb/devices/usb1/1-0:1.0/usb1-port5"   # root-hub port of the topcase's dead USB side (usb 1-5)
 SWITCH_SCRIPT="/usr/local/bin/applespi-force"
 UNIT_FILE="/etc/systemd/system/applespi-force.service"
 HOOK_INSTALL="/etc/initcpio/install/applespi-force"
@@ -260,17 +261,26 @@ EOF
 # replaces this kernel's log with the image's).
 APPLESPI_TRIES=3
 APPLESPI_LUKS_TIMEOUT=600
+APPLESPI_USB_PORT='$USB_PORT'
 
 applespi_log() { echo "applespi-force: \$*" > /dev/kmsg; }
 # the touchpad input device is only registered once the topcase has answered over SPI
 applespi_alive() { grep -qx 'Apple SPI Touchpad' /sys/class/input/input*/name 2>/dev/null; }
 
 run_earlyhook() {
-    local P='$ACPI_PATH' try=1 i root_dev="\${root:-/dev/mapper/root}"
+    local P='$ACPI_PATH' try=1 i port_off=0 root_dev="\${root:-/dev/mapper/root}"
     modprobe acpi_call
     modprobe intel_lpss_pci
     modprobe spi_pxa2xx_pci
     modprobe spi_pxa2xx_platform
+    # The kernel is enumerating the dead USB side of the topcase (usb 1-5) right about now. UIEN 0 in
+    # the middle of that leaves the hub waiting for 3 x 5 s descriptor timeouts, and udev - and with
+    # it the splash and the LUKS prompt - waits along (black screen). So power the port off first:
+    # the write only returns once the hub is done with the port (early_stop: after one failed try).
+    if [ -e "\$APPLESPI_USB_PORT/disable" ]; then
+        echo 1 2>/dev/null > "\$APPLESPI_USB_PORT/early_stop"
+        echo 1 2>/dev/null > "\$APPLESPI_USB_PORT/disable" && port_off=1
+    fi
     while :; do
         printf '%s\n' "\$P.UIEN 0" > /proc/acpi/call
         printf '%s\n' "\$P.SIEN 1" > /proc/acpi/call
@@ -280,6 +290,11 @@ run_earlyhook() {
         if applespi_alive; then applespi_log "topcase up (attempt \$try)"; break; fi
         applespi_log "no answer from topcase (attempt \$try of \$APPLESPI_TRIES)"
         [ \$try -ge \$APPLESPI_TRIES ] && break
+        # in case the topcase does depend on that port's power after all: the keyboard matters more
+        if [ \$port_off = 1 ]; then
+            echo 0 2>/dev/null > "\$APPLESPI_USB_PORT/disable"; port_off=0
+            applespi_log "USB port powered back on"
+        fi
         try=\$((try+1)); sleep 1
     done
 
@@ -519,6 +534,12 @@ phase_verify() {
   # acpi_call must load before the root filesystem is mounted (= inside the initramfs, before the LUKS prompt)
   chk "hook ran in initrd (acpi_call before root mount)" "awk '/acpi_call: loading/{if(!a)a=NR} /BTRFS info .*first mount of filesystem/{if(!b)b=NR} END{exit !(a && b && a<b)}' $klog"
   chk "initramfs hook has retry + LUKS watchdog" "grep -q 'run_cleanuphook' $HOOK_RUNTIME && grep -q 'APPLESPI_LUKS_TIMEOUT' $HOOK_RUNTIME"
+  chk "initramfs hook powers off the dead USB port first" "grep -q 'APPLESPI_USB_PORT/disable' $HOOK_RUNTIME"
+  # usb 1-5 cut off mid-enumeration = ~15 s of black screen before the LUKS prompt
+  local gap; gap=$(sudo journalctl -k -b -o json --no-pager | jq -r 'select(._SOURCE_MONOTONIC_TIMESTAMP != null) | [(._SOURCE_MONOTONIC_TIMESTAMP | tonumber / 1e6), (.MESSAGE | tostring)] | @tsv' 2>/dev/null \
+    | awk -F'\t' '/fb0: i915drmfb/{if(!a)a=$1} /device-mapper: ioctl/{if(!b)b=$1} END{if(a && b) printf "%d", b-a}')
+  if [[ -n $gap ]]; then chk "LUKS prompt within 5 s of the display coming up (was ${gap} s)" "(( gap < 5 ))"
+  else warn "could not time display → LUKS prompt for this boot (needs jq)"; fi
   if grep -q 'applespi-force: ' "$klog"; then
     chk "initramfs hook: topcase answered"  "grep -q 'applespi-force: topcase up' $klog"
     grep -q 'applespi-force: topcase up (attempt 1)' "$klog" \
