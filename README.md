@@ -270,11 +270,6 @@ sudo limine-update
 sudo reboot
 sudo dmesg | grep -iE "acpi_call|modeswitch"     # both at ~1–3 s, not ~12 s
 ```
-
-### 5.5 Incident 23 Sep – 3 Oct 2026: keyboard dead at the LUKS prompt after hibernate
-
-Hibernated at 77 % (23 Sep 09:50, suspend-then-hibernate). On the next power-on the built-in keyboard did not react at the LUKS prompt; the machine was left alone for days. On 3 Oct it booted normally and resumed fine, but at 1.3 %. A hibernated (off) Mac does not use ~49 Wh in 10 days → it sat powered on at the LUKS prompt for hours. The failed boot itself left no log (never got past LUKS → nothing written to the journal; a successful resume replaces the early-boot kernel log). Config and initramfs were unchanged and `applespi` had never logged an error → one-off failure in the early hook, not a broken setup. Response: retry + watchdog + logging in 5.2. If it happens without the watchdog: hold power to force off and cold-boot again, don't close the lid on the prompt.
-
 ---
 
 ## 6. Part 3b — suspend / resume
