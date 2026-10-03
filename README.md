@@ -180,20 +180,80 @@ help() {
 
 ```sh
 #!/usr/bin/ash
+# Switch the MacBookPro12,1 topcase to SPI before the LUKS prompt; retry if it does not answer.
+# Also arms a watchdog: root not unlocked within APPLESPI_LUKS_TIMEOUT seconds -> power off, so a
+# dead keyboard (or a self-wake after hibernate) cannot drain the battery at the prompt. Nothing is
+# mounted yet at that point, so a pending hibernation image stays intact and the next boot resumes.
+# Results go to /dev/kmsg ("applespi-force: ..." in the journal, cold boots only - a resume
+# replaces this kernel's log with the image's).
+APPLESPI_TRIES=3
+APPLESPI_LUKS_TIMEOUT=600
+APPLESPI_USB_PORT='/sys/bus/usb/devices/usb1/1-0:1.0/usb1-port5'
+
+applespi_log() { echo "applespi-force: $*" > /dev/kmsg; }
+# the touchpad input device is only registered once the topcase has answered over SPI
+applespi_alive() { grep -qx 'Apple SPI Touchpad' /sys/class/input/input*/name 2>/dev/null; }
+
 run_earlyhook() {
-    P='\_SB_.PCI0.SPI1.SPIT'
+    local P='\_SB_.PCI0.SPI1.SPIT' try=1 i port_off=0 root_dev="${root:-/dev/mapper/root}"
     modprobe acpi_call
-    printf '%s\n' "$P.UIEN 0" > /proc/acpi/call
-    printf '%s\n' "$P.SIEN 1" > /proc/acpi/call
     modprobe intel_lpss_pci
     modprobe spi_pxa2xx_pci
     modprobe spi_pxa2xx_platform
-    modprobe -r applespi 2>/dev/null
-    modprobe applespi
+    # The kernel is enumerating the dead USB side of the topcase (usb 1-5) right about now. UIEN 0 in
+    # the middle of that leaves the hub waiting for 3 x 5 s descriptor timeouts, and udev - and with
+    # it the splash and the LUKS prompt - waits along (black screen). So power the port off first:
+    # the write only returns once the hub is done with the port (early_stop: after one failed try).
+    if [ -e "$APPLESPI_USB_PORT/disable" ]; then
+        echo 1 2>/dev/null > "$APPLESPI_USB_PORT/early_stop"
+        echo 1 2>/dev/null > "$APPLESPI_USB_PORT/disable" && port_off=1
+    fi
+    while :; do
+        printf '%s\n' "$P.UIEN 0" > /proc/acpi/call
+        printf '%s\n' "$P.SIEN 1" > /proc/acpi/call
+        modprobe -r applespi 2>/dev/null
+        modprobe applespi
+        i=0; while [ $i -lt 30 ] && ! applespi_alive; do sleep 0.1; i=$((i+1)); done
+        if applespi_alive; then applespi_log "topcase up (attempt $try)"; break; fi
+        applespi_log "no answer from topcase (attempt $try of $APPLESPI_TRIES)"
+        [ $try -ge $APPLESPI_TRIES ] && break
+        # in case the topcase does depend on that port's power after all: the keyboard matters more
+        if [ $port_off = 1 ]; then
+            echo 0 2>/dev/null > "$APPLESPI_USB_PORT/disable"; port_off=0
+            applespi_log "USB port powered back on"
+        fi
+        try=$((try+1)); sleep 1
+    done
+
+    (
+        t=0
+        while [ $t -lt $APPLESPI_LUKS_TIMEOUT ]; do
+            [ -e "$root_dev" ] && exit 0
+            sleep 5; t=$((t+5))
+        done
+        applespi_log "$root_dev not unlocked after ${APPLESPI_LUKS_TIMEOUT}s, powering off"
+        sleep 1
+        poweroff -f
+    ) </dev/null >/dev/null 2>&1 &
+    APPLESPI_WATCHDOG=$!
+}
+
+# the watchdog exits by itself once root is unlocked; make sure it never survives switch_root
+run_cleanuphook() {
+    [ -n "$APPLESPI_WATCHDOG" ] && kill "$APPLESPI_WATCHDOG" 2>/dev/null
+    return 0
 }
 ```
 
 `run_earlyhook` runs for every hook before any `run_hook`; the `encrypt` passphrase prompt is a `run_hook`, so ordering in HOOKS doesn't matter.
+
+What it does on top of the plain switch (added 3 Oct 2026, after the incident in 5.5):
+
+- **Liveness check + retry.** `Apple SPI Touchpad` is only registered once the topcase has answered over SPI (on a cold boot < 1 ms after `modprobe applespi`), so its presence in `/sys/class/input/*/name` is the test. Not there within 3 s → redo `UIEN 0`/`SIEN 1` + driver reload, up to 3 attempts (worst case ~12 s, only on failure). After that, boot continues (USB keyboard still works).
+- **LUKS watchdog.** Root (`$root`, i.e. `/dev/mapper/root`) not unlocked within 600 s → `poweroff -f`. The initramfs has no lid handling, so without this a dead keyboard or a self-wake (7.5) sits at the prompt until the battery is empty. Nothing is mounted at that point, so a pending hibernation image is untouched and the next boot still resumes. The watchdog exits by itself once root is unlocked; `run_cleanuphook` kills it before `switch_root` as a safety net.
+- **Logging** via `/dev/kmsg`: `sudo journalctl -k -b | grep applespi-force:` → `topcase up (attempt 1)` normally. Cold boots only (a resume replaces this kernel's log with the image's). `--verify` checks it and warns when retries were needed. (With `-o cat` journald drops the `applespi-force:` prefix — it becomes `SYSLOG_IDENTIFIER` — so `--verify` fetches those lines by identifier.) First seen in action on the first boot with this hook: `no answer from topcase (attempt 1 of 3)` → `topcase up (attempt 2)`.
+
+- **USB port off before `UIEN 0`** (added 3 Oct 2026). Symptom: ~15 s of black screen between Limine and the LUKS prompt on most boots and resumes. Cause: xhci is built in and starts enumerating the dead `usb 1-5` at ~1.0 s, exactly when the hook runs. `UIEN 0` in the middle of a descriptor read makes the device vanish without a disconnect event, the hub sits out 3 × `usbcore.initial_descriptor_timeout` (5 s), and `udevadm settle` in the `udev` hook - which runs before `plymouth` and `encrypt` - waits for it. In the kernel log: `usb 1-5: new full-speed USB device`, then nothing between `fb0: i915drmfb` (~2.5 s) and `device-mapper: ioctl` (~18 s; `encrypt` loads dm-crypt before it prompts). Boots where the hook won the race (no `usb 1-5` line at all) had the prompt 0.3 s after the display. Fix: write `1` to the port's `early_stop` and `disable` first; the `disable` write takes the hub lock, so it returns only after the running enumeration attempt has failed (fast, the device still answers with `-71`), and the port stays off. If the topcase then does not answer, the port is powered back on before the retry. `--verify` times display → prompt and fails above 5 s.
 
 ### 5.3 `/etc/mkinitcpio.conf.d/zz-applespi-force.conf`
 
@@ -210,6 +270,10 @@ sudo limine-update
 sudo reboot
 sudo dmesg | grep -iE "acpi_call|modeswitch"     # both at ~1–3 s, not ~12 s
 ```
+
+### 5.5 Incident 23 Sep – 3 Oct 2026: keyboard dead at the LUKS prompt after hibernate
+
+Hibernated at 77 % (23 Sep 09:50, suspend-then-hibernate). On the next power-on the built-in keyboard did not react at the LUKS prompt; the machine was left alone for days. On 3 Oct it booted normally and resumed fine, but at 1.3 %. A hibernated (off) Mac does not use ~49 Wh in 10 days → it sat powered on at the LUKS prompt for hours. The failed boot itself left no log (never got past LUKS → nothing written to the journal; a successful resume replaces the early-boot kernel log). Config and initramfs were unchanged and `applespi` had never logged an error → one-off failure in the early hook, not a broken setup. Response: retry + watchdog + logging in 5.2. If it happens without the watchdog: hold power to force off and cold-boot again, don't close the lid on the prompt.
 
 ---
 
@@ -479,7 +543,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `/usr/local/bin/applespi-force` | UIEN 0 / SIEN 1 / reload applespi |
 | `/etc/systemd/system/applespi-force.service` | runs the script at boot (main system) |
 | `/etc/initcpio/install/applespi-force` | adds modules + runscript to initramfs |
-| `/etc/initcpio/hooks/applespi-force` | early hook: switch to SPI before LUKS prompt |
+| `/etc/initcpio/hooks/applespi-force` | early hook: switch to SPI before LUKS prompt (verified, 3 tries), 10-min LUKS power-off watchdog |
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
 | `/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` | `HibernateMode=shutdown`: plain power-off after hibernate instead of ACPI S4 (7.4) |
@@ -513,6 +577,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `usb 1-5: … error -71` | dead USB path on topcase | expected; use SPI mode |
 | `applespi: SPI transfer timed out` / `-110` | LPSS DMA bug | `initcall_blacklist=dw_pci_driver_init` |
 | unit `status=203/EXEC` "Permission denied" | script not executable | `chmod 755 /usr/local/bin/applespi-force` |
+| keyboard dead at LUKS prompt, machine left on drains battery | early hook switch did not take (one-off) | hook retries 3× and powers off after 10 min unlocked (5.2); check `journalctl -k -b \| grep applespi-force:` |
 | `acpi_call` first loads at ~12 s, keyboard dead at LUKS | hook not in initramfs (drop-in clobbered) | `zz-` drop-in name, rebuild, check for build-hook line |
 | keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
 | lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
