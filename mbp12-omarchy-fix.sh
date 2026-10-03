@@ -252,16 +252,54 @@ help() {
 EOF
   write_file "$HOOK_RUNTIME" 644 <<EOF
 #!/usr/bin/ash
+# Switch the MacBookPro12,1 topcase to SPI before the LUKS prompt; retry if it does not answer.
+# Also arms a watchdog: root not unlocked within APPLESPI_LUKS_TIMEOUT seconds -> power off, so a
+# dead keyboard (or a self-wake after hibernate) cannot drain the battery at the prompt. Nothing is
+# mounted yet at that point, so a pending hibernation image stays intact and the next boot resumes.
+# Results go to /dev/kmsg ("applespi-force: ..." in the journal, cold boots only - a resume
+# replaces this kernel's log with the image's).
+APPLESPI_TRIES=3
+APPLESPI_LUKS_TIMEOUT=600
+
+applespi_log() { echo "applespi-force: \$*" > /dev/kmsg; }
+# the touchpad input device is only registered once the topcase has answered over SPI
+applespi_alive() { grep -qx 'Apple SPI Touchpad' /sys/class/input/input*/name 2>/dev/null; }
+
 run_earlyhook() {
-    P='$ACPI_PATH'
+    local P='$ACPI_PATH' try=1 i root_dev="\${root:-/dev/mapper/root}"
     modprobe acpi_call
-    printf '%s\n' "\$P.UIEN 0" > /proc/acpi/call
-    printf '%s\n' "\$P.SIEN 1" > /proc/acpi/call
     modprobe intel_lpss_pci
     modprobe spi_pxa2xx_pci
     modprobe spi_pxa2xx_platform
-    modprobe -r applespi 2>/dev/null
-    modprobe applespi
+    while :; do
+        printf '%s\n' "\$P.UIEN 0" > /proc/acpi/call
+        printf '%s\n' "\$P.SIEN 1" > /proc/acpi/call
+        modprobe -r applespi 2>/dev/null
+        modprobe applespi
+        i=0; while [ \$i -lt 30 ] && ! applespi_alive; do sleep 0.1; i=\$((i+1)); done
+        if applespi_alive; then applespi_log "topcase up (attempt \$try)"; break; fi
+        applespi_log "no answer from topcase (attempt \$try of \$APPLESPI_TRIES)"
+        [ \$try -ge \$APPLESPI_TRIES ] && break
+        try=\$((try+1)); sleep 1
+    done
+
+    (
+        t=0
+        while [ \$t -lt \$APPLESPI_LUKS_TIMEOUT ]; do
+            [ -e "\$root_dev" ] && exit 0
+            sleep 5; t=\$((t+5))
+        done
+        applespi_log "\$root_dev not unlocked after \${APPLESPI_LUKS_TIMEOUT}s, powering off"
+        sleep 1
+        poweroff -f
+    ) </dev/null >/dev/null 2>&1 &
+    APPLESPI_WATCHDOG=\$!
+}
+
+# the watchdog exits by itself once root is unlocked; make sure it never survives switch_root
+run_cleanuphook() {
+    [ -n "\$APPLESPI_WATCHDOG" ] && kill "\$APPLESPI_WATCHDOG" 2>/dev/null
+    return 0
 }
 EOF
   # "zz-" so it sorts after omarchy_hooks.conf, which reassigns HOOKS=(...) and would clobber a += that loads earlier
@@ -467,6 +505,8 @@ phase_verify() {
   # Dumped to a file because `journalctl | grep -q` dies of SIGPIPE under `set -o pipefail` on an early match.
   local klog; klog=$(mktemp)
   sudo journalctl -k -b -o cat --no-pager > "$klog"
+  # journald turns the hook's "applespi-force: " prefix into SYSLOG_IDENTIFIER, which -o cat drops
+  sudo journalctl -k -b -o cat --no-pager SYSLOG_IDENTIFIER=applespi-force | sed 's/^/applespi-force: /' >> "$klog"
   for p in "${KPARAMS[@]}"; do chk "cmdline has $p" "kernel_has $p"; done
   chk "SPI controller in PIO mode"        "grep -q 'no DMA channels available, using PIO' $klog"
   chk "acpi_call module available"        "modinfo acpi_call >/dev/null 2>&1"
@@ -478,7 +518,15 @@ phase_verify() {
   # early-boot journal timestamps are all the journald start time, so compare order instead:
   # acpi_call must load before the root filesystem is mounted (= inside the initramfs, before the LUKS prompt)
   chk "hook ran in initrd (acpi_call before root mount)" "awk '/acpi_call: loading/{if(!a)a=NR} /BTRFS info .*first mount of filesystem/{if(!b)b=NR} END{exit !(a && b && a<b)}' $klog"
-  chk "mem_sleep is s2idle"               "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
+  chk "initramfs hook has retry + LUKS watchdog" "grep -q 'run_cleanuphook' $HOOK_RUNTIME && grep -q 'APPLESPI_LUKS_TIMEOUT' $HOOK_RUNTIME"
+  if grep -q 'applespi-force: ' "$klog"; then
+    chk "initramfs hook: topcase answered"  "grep -q 'applespi-force: topcase up' $klog"
+    grep -q 'applespi-force: topcase up (attempt 1)' "$klog" \
+      || warn "initramfs hook needed retries this boot: $(grep -o 'applespi-force: .*' "$klog" | tr '\n' ';')"
+  else
+    warn "no 'applespi-force:' lines in this boot's kernel log (hook predates the retry version, or not rebooted yet)"
+  fi
+  chk "mem_sleep is s2idle"             "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
   chk "sleep hook executable"             "[[ -x $SLEEP_HOOK ]]"
   chk "Wi-Fi card visible on PCI (class 0x028000)" "grep -lxq 0x028000 /sys/bus/pci/devices/*/class"
   chk "sleep hook is the detached-recovery version" "grep -q 'wifi-resume)' $SLEEP_HOOK"
