@@ -58,20 +58,20 @@ BACKUP_ROOT="/root/mbp12-fix-backups"
 PHASE="all"; DRY_RUN=0; VERIFY_ONLY=0; FORCE_MODEL=0; ASSUME_YES=0; SWAP_SIZE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --phase) PHASE="$2"; shift 2 ;;
+    --phase) PHASE="${2:?--phase needs a value}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --verify) VERIFY_ONLY=1; shift ;;
     --force-model) FORCE_MODEL=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
-    --swap-size) SWAP_SIZE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    --swap-size) SWAP_SIZE="${2:?--swap-size needs a value}"; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
 # ----------------------------------------------------------------------------- helpers
 C_INFO=$'\e[1;34m'; C_OK=$'\e[1;32m'; C_WARN=$'\e[1;33m'; C_ERR=$'\e[1;31m'; C_RST=$'\e[0m'
-STEP=""; CHANGED=0; NEEDS_REBUILD=0; NEEDS_REBOOT=0; BACKUP_DIR=""
+STEP=""; WROTE=0; NEEDS_REBUILD=0; NEEDS_REBOOT=0; BACKUP_DIR=""
 info() { echo "${C_INFO}==>${C_RST} $*"; }
 ok()   { echo "${C_OK}  ✓${C_RST} $*"; }
 warn() { echo "${C_WARN}  !${C_RST} $*"; }
@@ -86,10 +86,9 @@ on_err() {
 }
 trap 'on_err $LINENO' ERR
 
-# run a privileged command (echo only in dry-run)
-run() {
-  if (( DRY_RUN )); then echo "  [dry-run] sudo $*"; else sudo "$@"; fi
-}
+# run: privileged command; run_user: as the invoking user (both only echo in dry-run)
+run()      { if (( DRY_RUN )); then echo "  [dry-run] sudo $*"; else sudo "$@"; fi; }
+run_user() { if (( DRY_RUN )); then echo "  [dry-run] $*"; else "$@"; fi; }
 backup() {
   local f="$1"
   [[ -e $f ]] || return 0
@@ -97,41 +96,27 @@ backup() {
     BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
     (( DRY_RUN )) || sudo mkdir -p "$BACKUP_DIR"
   fi
-  (( DRY_RUN )) || sudo cp -a "$f" "$BACKUP_DIR/$(echo "$f" | tr / _)"
+  (( DRY_RUN )) || sudo cp -a "$f" "$BACKUP_DIR/${f//\//_}"
 }
-# write_file <path> <mode> <<content ; idempotent, backs up, diffs in dry-run
+# write_file <path> <mode> <<content ; idempotent, backs up, diffs in dry-run; sets WROTE=1 if the file changed.
+# Files under $HOME are written unprivileged and get a .bak.<timestamp> copy next to them instead.
 write_file() {
-  local path="$1" mode="$2" tmp
-  tmp=$(mktemp); cat > "$tmp"
-  if [[ -e $path ]] && sudo cmp -s "$tmp" "$path" && [[ $(sudo stat -c %a "$path") == "$mode" ]]; then
+  local path="$1" mode="$2" tmp as=(sudo)
+  [[ $path == "$HOME"/* ]] && as=()
+  tmp=$(mktemp); cat > "$tmp"; WROTE=0
+  if [[ -e $path ]] && "${as[@]}" cmp -s "$tmp" "$path" && [[ $("${as[@]}" stat -c %a "$path") == "$mode" ]]; then
     ok "$path up to date"; rm -f "$tmp"; return 0
   fi
   if (( DRY_RUN )); then
     echo "  [dry-run] would write $path (mode $mode):"
-    if [[ -e $path ]]; then sudo diff -u "$path" "$tmp" | sed 's/^/      /' || true; else sed 's/^/      | /' "$tmp"; fi
+    if [[ -e $path ]]; then "${as[@]}" diff -u "$path" "$tmp" | sed 's/^/      /' || true; else sed 's/^/      | /' "$tmp"; fi
   else
-    backup "$path"
-    sudo install -D -m "$mode" "$tmp" "$path"
+    if (( ${#as[@]} )); then backup "$path"
+    elif [[ -e $path ]]; then cp -a "$path" "$path.bak.$(date +%Y%m%d-%H%M%S)"; fi
+    "${as[@]}" install -D -m "$mode" "$tmp" "$path"
     ok "wrote $path"
   fi
-  rm -f "$tmp"; CHANGED=1
-}
-# write_user_file <path> <mode> <<content ; same as write_file but unprivileged (files under $HOME)
-write_user_file() {
-  local path="$1" mode="$2" tmp
-  tmp=$(mktemp); cat > "$tmp"
-  if [[ -e $path ]] && cmp -s "$tmp" "$path" && [[ $(stat -c %a "$path") == "$mode" ]]; then
-    ok "$path up to date"; rm -f "$tmp"; return 0
-  fi
-  if (( DRY_RUN )); then
-    echo "  [dry-run] would write $path (mode $mode):"
-    if [[ -e $path ]]; then diff -u "$path" "$tmp" | sed 's/^/      /' || true; else sed 's/^/      | /' "$tmp"; fi
-  else
-    [[ -e $path ]] && cp -a "$path" "$path.bak.$(date +%Y%m%d-%H%M%S)"
-    install -D -m "$mode" "$tmp" "$path"
-    ok "wrote $path"
-  fi
-  rm -f "$tmp"; CHANGED=1
+  rm -f "$tmp"; WROTE=1
 }
 confirm() {
   (( ASSUME_YES )) && return 0
@@ -170,7 +155,7 @@ phase_kernel_params() {
     local line="KERNEL_CMDLINE[default]+=\" ${missing[*]}\""
     if (( DRY_RUN )); then echo "  [dry-run] would append to $LIMINE_CONF: $line"
     else echo "$line" | sudo tee -a "$LIMINE_CONF" >/dev/null; ok "appended: $line"; fi
-    CHANGED=1; NEEDS_REBUILD=1; NEEDS_REBOOT=1
+    NEEDS_REBUILD=1; NEEDS_REBOOT=1
   fi
   for p in "${KPARAMS[@]}"; do kernel_has "$p" || { warn "$p not active in the running kernel yet (reboot)"; NEEDS_REBOOT=1; }; done
 }
@@ -189,10 +174,9 @@ phase_acpi_call() {
   else
     local helper=""; for h in yay paru; do command -v $h >/dev/null && { helper=$h; break; }; done
     [[ -n $helper ]] || die "acpi_call missing and no AUR helper (yay/paru) found"
-    if (( DRY_RUN )); then echo "  [dry-run] $helper -S --needed --noconfirm acpi_call-dkms"
-    else $helper -S --needed --noconfirm acpi_call-dkms; fi
+    run_user "$helper" -S --needed --noconfirm acpi_call-dkms
     (( DRY_RUN )) || modinfo acpi_call >/dev/null 2>&1 || die "acpi_call still not available after install — check 'sudo dkms status'"
-    ok "acpi_call installed"; CHANGED=1
+    ok "acpi_call installed"
   fi
   run modprobe acpi_call
 }
@@ -225,7 +209,7 @@ ExecStart=/usr/local/bin/applespi-force
 WantedBy=sysinit.target
 EOF
   run systemctl daemon-reload
-  run systemctl enable applespi-force.service >/dev/null 2>&1 || true
+  run systemctl enable --quiet applespi-force.service
   if kernel_has "initcall_blacklist=dw_pci_driver_init"; then
     run systemctl restart applespi-force.service
     (( DRY_RUN )) || { sleep 2; sudo dmesg | grep -i applespi | tail -1 | grep -q "modeswitch done" \
@@ -237,7 +221,6 @@ EOF
 
 phase_initramfs() {
   step "Initramfs early hook (LUKS prompt)"
-  local changed_before=$CHANGED
   [[ -e /etc/initcpio/applespi-force-initrd.service ]] && { backup /etc/initcpio/applespi-force-initrd.service; run rm -f /etc/initcpio/applespi-force-initrd.service; }
   write_file "$HOOK_INSTALL" 644 <<'EOF'
 #!/bin/bash
@@ -253,6 +236,7 @@ help() {
     echo "Switch MacBookPro12,1 topcase to SPI before the LUKS prompt."
 }
 EOF
+  NEEDS_REBUILD=$(( NEEDS_REBUILD | WROTE ))
   write_file "$HOOK_RUNTIME" 644 <<EOF
 #!/usr/bin/ash
 # Switch the MacBookPro12,1 topcase to SPI before the LUKS prompt; retry if it does not answer.
@@ -319,11 +303,12 @@ run_cleanuphook() {
     return 0
 }
 EOF
+  NEEDS_REBUILD=$(( NEEDS_REBUILD | WROTE ))
   # "zz-" so it sorts after omarchy_hooks.conf, which reassigns HOOKS=(...) and would clobber a += that loads earlier
   write_file "$HOOK_CONF" 644 <<'EOF'
 HOOKS+=(applespi-force)
 EOF
-  (( changed_before != CHANGED )) && NEEDS_REBUILD=1 || true
+  NEEDS_REBUILD=$(( NEEDS_REBUILD | WROTE ))
 }
 
 phase_sleep() {
@@ -401,7 +386,7 @@ case "$1" in
 esac
 EOF
   # user side: the hook starts this unit in the session user's manager once NetworkManager is back
-  write_user_file "$SHELL_REFRESH_SCRIPT" 755 <<'EOF'
+  write_file "$SHELL_REFRESH_SCRIPT" 755 <<'EOF'
 #!/bin/bash
 # Started by /usr/lib/systemd/system-sleep/applespi after resume, once NetworkManager is back.
 # NetworkManager gets restarted there, which leaves the Omarchy shell's network
@@ -414,7 +399,7 @@ while omarchy-hyprland-session-locked; do sleep 0.2; done
 
 exec omarchy-restart-shell
 EOF
-  write_user_file "$SHELL_REFRESH_UNIT" 644 <<'EOF'
+  write_file "$SHELL_REFRESH_UNIT" 644 <<'EOF'
 [Unit]
 Description=Restart Omarchy shell after resume (NetworkManager restarted, Wi-Fi interface recreated)
 
@@ -422,7 +407,7 @@ Description=Restart Omarchy shell after resume (NetworkManager restarted, Wi-Fi 
 Type=oneshot
 ExecStart=%h/.local/bin/shell-refresh-on-resume
 EOF
-  if (( DRY_RUN )); then echo "  [dry-run] systemctl --user daemon-reload"; else systemctl --user daemon-reload; fi
+  run_user systemctl --user daemon-reload
   local ms; ms=$(cat /sys/power/mem_sleep 2>/dev/null || true)
   [[ $ms == *"[s2idle]"* ]] && ok "mem_sleep: $ms" || warn "mem_sleep is '$ms' — becomes [s2idle] after reboot"
 }
@@ -443,20 +428,20 @@ phase_hibernation() {
 HibernateMode=shutdown
 EOF
 
-  local mem_kb size; mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-  size=${SWAP_SIZE:-"$(( (mem_kb + 1048575) / 1048576 + 2 ))g"}; size=${size,,}
-  [[ $size =~ ^[0-9]+g$ ]] || die "--swap-size must look like 18g"
-  local free_gb; free_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
-  (( free_gb > ${size%g} + 1 )) || die "not enough free space for a ${size} swapfile (free: ${free_gb}G)"
-
-  local nested top mounted
-  nested=$(sudo btrfs subvolume list / | awk '$NF=="swap" && $7!="5"{print 1}')
-  top=$(sudo btrfs subvolume list / | awk -v s="$SWAP_SUBVOL" '$NF==s && $7=="5"{print 1}')
+  local subvols nested top mounted
+  subvols=$(sudo btrfs subvolume list /)
+  nested=$(awk '$NF=="swap" && $7!="5"{print 1}' <<<"$subvols")
+  top=$(awk -v s="$SWAP_SUBVOL" '$NF==s && $7=="5"{print 1}' <<<"$subvols")
   mounted=$(findmnt -no OPTIONS "$SWAP_MNT" 2>/dev/null | grep -o "subvol=/$SWAP_SUBVOL" || true)
 
   if [[ -n $top && -n $mounted && -f $SWAP_FILE ]]; then
     ok "already migrated: $SWAP_SUBVOL mounted at $SWAP_MNT, swapfile present"
   else
+    local mem_kb size free_gb; mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    size=${SWAP_SIZE:-"$(( (mem_kb + 1048575) / 1048576 + 2 ))g"}; size=${size,,}
+    [[ $size =~ ^[0-9]+g$ ]] || die "--swap-size must look like 18g"
+    free_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+    (( free_gb > ${size%g} + 1 )) || die "not enough free space for a ${size} swapfile (free: ${free_gb}G)"
     warn "this deletes the nested swap subvolume (@/swap) and recreates the swapfile (${size})"
     confirm "Proceed with the swap migration?" || die "aborted by user"
     if swapon --show=NAME --noheadings | grep -qx "$SWAP_FILE"; then run swapoff "$SWAP_FILE"; fi
@@ -479,7 +464,6 @@ EOF
     [[ -n $mounted ]] || run mount "$SWAP_MNT"
     (( DRY_RUN )) || [[ -f $SWAP_FILE ]] || sudo btrfs filesystem mkswapfile --size "$size" "$SWAP_FILE"
     run swapon -a
-    CHANGED=1
   fi
 
   # priority check (bare `swapon` gives -1, which systemd ignores for hibernation)
@@ -493,7 +477,7 @@ EOF
     if [[ $off != "$cur" ]]; then
       backup "$RESUME_DROPIN"; backup "$LIMINE_CONF"
       sudo sed -i "s/resume_offset=[0-9]*/resume_offset=$off/" "$RESUME_DROPIN" "$LIMINE_CONF"
-      ok "resume_offset updated $cur → $off"; CHANGED=1; NEEDS_REBUILD=1
+      ok "resume_offset updated $cur → $off"; NEEDS_REBUILD=1
     else ok "resume_offset $off matches"; fi
   fi
   local can; can=$(busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate 2>/dev/null | awk '{print $2}')
@@ -504,15 +488,13 @@ EOF
   # 5 % instead of the default 2 % leaves an aged battery enough charge to write the image.
   # UPower needs Low > Critical > Action or it falls back to its defaults, hence Critical=10.
   # Asleep is covered by systemd itself: suspend-then-hibernate wakes on the ACPI battery alarm (< 5 %).
-  local changed_before=$CHANGED; CHANGED=0
   write_file "$UPOWER_CONF" 644 <<'EOF'
 [UPower]
 PercentageCritical=10.0
 PercentageAction=5.0
 CriticalPowerAction=Hibernate
 EOF
-  if (( CHANGED )); then run systemctl restart upower; fi
-  CHANGED=$(( changed_before | CHANGED ))
+  if (( WROTE )); then run systemctl restart upower; fi
 }
 
 phase_rebuild() {
@@ -536,9 +518,8 @@ phase_verify() {
   # a day or a few suspend cycles; the journal keeps them (also across hibernation: same boot ID).
   # Dumped to a file because `journalctl | grep -q` dies of SIGPIPE under `set -o pipefail` on an early match.
   local klog; klog=$(mktemp)
-  sudo journalctl -k -b -o cat --no-pager > "$klog"
-  # journald turns the hook's "applespi-force: " prefix into SYSLOG_IDENTIFIER, which -o cat drops
-  sudo journalctl -k -b -o cat --no-pager SYSLOG_IDENTIFIER=applespi-force | sed 's/^/applespi-force: /' >> "$klog"
+  # -o short, not cat: journald turns the hook's "applespi-force: " prefix into SYSLOG_IDENTIFIER, which cat drops
+  sudo journalctl -k -b -o short --no-pager > "$klog"
   for p in "${KPARAMS[@]}"; do chk "cmdline has $p" "kernel_has $p"; done
   chk "SPI controller in PIO mode"        "grep -q 'no DMA channels available, using PIO' $klog"
   chk "acpi_call module available"        "modinfo acpi_call >/dev/null 2>&1"
@@ -592,7 +573,7 @@ phase_verify() {
 # ============================================================================= main
 (( DRY_RUN )) && warn "DRY RUN — nothing will be changed"
 phase_preflight
-if (( VERIFY_ONLY )); then phase_verify && exit 0 || exit 1; fi
+if (( VERIFY_ONLY )) || [[ $PHASE == verify ]]; then phase_verify && exit 0 || exit 1; fi
 
 case "$PHASE" in
   all)          phase_kernel_params; phase_acpi_call; phase_switch; phase_initramfs; phase_sleep; phase_rebuild ;;
@@ -602,14 +583,13 @@ case "$PHASE" in
   initramfs)    phase_initramfs; phase_rebuild ;;
   sleep)        phase_sleep ;;
   hibernation)  phase_hibernation; phase_rebuild ;;
-  verify)       phase_verify && exit 0 || exit 1 ;;
   *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|verify)" ;;
 esac
 
 echo
 if (( NEEDS_REBOOT )); then
   warn "Reboot required. Keep a USB keyboard attached for this one, then run: $0 --verify"
-  [[ $PHASE == all ]] && warn "Hibernation is opt-in: after a clean --verify, run 'sudo omarchy-hibernation-setup' (if not done) then: $0 --phase hibernation"
+  if [[ $PHASE == all ]]; then warn "Hibernation is opt-in: after a clean --verify, run 'sudo omarchy-hibernation-setup' (if not done) then: $0 --phase hibernation"; fi
 else
   ok "Done. Run: $0 --verify"
 fi
