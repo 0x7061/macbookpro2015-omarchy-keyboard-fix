@@ -11,7 +11,8 @@
 #   sleep          s2idle drop-in + system-sleep hook (applespi/brcmfmac detach; on resume applespi is
 #                  reattached immediately, Wi-Fi slot power-cycle + supplicant/NM restart run detached)
 #                  + user unit that restarts the Omarchy shell once the session is unlocked
-#   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset
+#   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset,
+#                  hibernate at 5 % battery while awake (UPower default: 2 %, hybrid sleep)
 #   verify         read-only checks; run this after each reboot
 #
 # Usage:
@@ -41,6 +42,7 @@ HOOK_RUNTIME="/etc/initcpio/hooks/applespi-force"
 HOOK_CONF="/etc/mkinitcpio.conf.d/zz-applespi-force.conf"
 SLEEP_CONF="/etc/systemd/sleep.conf.d/mac-s2idle.conf"
 HIBERNATE_CONF="/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf"
+UPOWER_CONF="/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf"   # name must match NN-name.conf
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/applespi"
 SHELL_REFRESH_SCRIPT="$HOME/.local/bin/shell-refresh-on-resume"
 SHELL_REFRESH_UNIT="$HOME/.config/systemd/user/shell-refresh-on-resume.service"
@@ -496,6 +498,21 @@ EOF
   fi
   local can; can=$(busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate 2>/dev/null | awk '{print $2}')
   [[ $can == '"yes"' ]] && ok "logind CanHibernate = yes" || warn "logind CanHibernate = ${can:-?} (re-check after reboot)"
+
+  # Battery empty while awake: UPower acts at PercentageAction. Its default "Auto" prefers
+  # HybridSleep, which keeps RAM powered on an empty battery; hibernate instead (README 7.7).
+  # 5 % instead of the default 2 % leaves an aged battery enough charge to write the image.
+  # UPower needs Low > Critical > Action or it falls back to its defaults, hence Critical=10.
+  # Asleep is covered by systemd itself: suspend-then-hibernate wakes on the ACPI battery alarm (< 5 %).
+  local changed_before=$CHANGED; CHANGED=0
+  write_file "$UPOWER_CONF" 644 <<'EOF'
+[UPower]
+PercentageCritical=10.0
+PercentageAction=5.0
+CriticalPowerAction=Hibernate
+EOF
+  if (( CHANGED )); then run systemctl restart upower; fi
+  CHANGED=$(( changed_before | CHANGED ))
 }
 
 phase_rebuild() {
@@ -562,6 +579,8 @@ phase_verify() {
     chk "resume_offset matches swapfile"    "[[ \$(sudo btrfs inspect-internal map-swapfile -r $SWAP_FILE) == \$(grep -oE 'resume_offset=[0-9]+' /proc/cmdline | cut -d= -f2) ]]"
     chk "HibernateMode=shutdown (no ACPI S4)" "systemd-analyze cat-config systemd/sleep.conf | grep -qx 'HibernateMode=shutdown'"
     chk "logind CanHibernate = yes"         "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate | grep -q '\"yes\"'"
+    chk "UPower critical action is Hibernate" "upower -d | grep -qE 'critical-action:\s+Hibernate'"
+    chk "UPower acts at 5 %"                  "grep -qx 'PercentageAction=5.0' $UPOWER_CONF"
   else
     warn "hibernation not configured (no $RESUME_DROPIN) — run 'sudo omarchy-hibernation-setup', then --phase hibernation"
   fi
