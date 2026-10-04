@@ -270,6 +270,11 @@ sudo limine-update
 sudo reboot
 sudo dmesg | grep -iE "acpi_call|modeswitch"     # both at ~1–3 s, not ~12 s
 ```
+
+### 5.5 Incident 23 Sep – 3 Oct 2026: keyboard dead at the LUKS prompt after hibernate
+
+Hibernated at 77 % (23 Sep 09:50, suspend-then-hibernate). On the next power-on the built-in keyboard did not react at the LUKS prompt; the machine was left alone for days. On 3 Oct it booted normally and resumed fine, but at 1.3 %. A hibernated (off) Mac does not use ~49 Wh in 10 days → it sat powered on at the LUKS prompt for hours. The failed boot itself left no log (never got past LUKS → nothing written to the journal; a successful resume replaces the early-boot kernel log). Config and initramfs were unchanged and `applespi` had never logged an error → one-off failure in the early hook, not a broken setup. Response: retry + watchdog + logging in 5.2. If it happens without the watchdog: hold power to force off and cold-boot again, don't close the lid on the prompt.
+
 ---
 
 ## 6. Part 3b — suspend / resume
@@ -518,7 +523,7 @@ To test a cycle: `sudo systemctl hibernate`, touch nothing for 2 minutes and wat
 ```ini
 # /etc/systemd/sleep.conf.d/hibernate-delay.conf
 [Sleep]
-HibernateDelaySec=2h
+HibernateDelaySec=1h
 
 # /etc/systemd/logind.conf.d/lid.conf
 [Login]
@@ -526,7 +531,19 @@ HandleLidSwitch=suspend-then-hibernate
 HandleLidSwitchExternalPower=suspend-then-hibernate
 ```
 
-`sudo systemctl restart systemd-logind` (logs you out) or reboot. The sleep hooks run around **both** sleep operations: `pre` → s2idle → `post` → (RTC wake after `HibernateDelaySec`) → `pre` again within ~300 ms → hibernate → `post`; the hook's `pre` handles that (6.2). The RTC wake needs `cat /sys/module/rtc_cmos/parameters/use_acpi_alarm` → `Y`; on this machine the driver enables it by itself. Only add `rtc_cmos.use_acpi_alarm=1` to the cmdline if it reads `N`.
+`sudo systemctl restart systemd-logind` (logs you out) or reboot. Hibernation then starts on whichever comes first: `HibernateDelaySec` elapsed, or the battery dropping below 5 % (systemd arms the ACPI battery alarm, `/sys/class/power_supply/BAT0/alarm`, as a wake source; not yet observed firing on this machine). `HibernateDelaySec` is therefore an upper bound, not the only trigger; without it the machine would stay in s2idle until the 5 % alarm. For comparison, macOS writes the image at every sleep and powers RAM off after 3 h. The sleep hooks run around **both** sleep operations: `pre` → s2idle → `post` → (RTC wake after `HibernateDelaySec`) → `pre` again within ~300 ms → hibernate → `post`; the hook's `pre` handles that (6.2). The RTC wake needs `cat /sys/module/rtc_cmos/parameters/use_acpi_alarm` → `Y`; on this machine the driver enables it by itself. Only add `rtc_cmos.use_acpi_alarm=1` to the cmdline if it reads `N`.
+
+### 7.7 Battery empty while awake: hibernate
+
+```ini
+# /etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf
+[UPower]
+PercentageCritical=10.0
+PercentageAction=5.0
+CriticalPowerAction=Hibernate
+```
+
+UPower acts when the battery reaches `PercentageAction`; 5 % instead of the default 2 % leaves an aged battery enough charge to write the image. UPower requires `PercentageLow` > `PercentageCritical` > `PercentageAction` and silently falls back to its defaults (20/5/2) otherwise, hence `PercentageCritical=10`. Its default action `Auto` prefers HybridSleep, which writes the image but then stays in s2idle on an empty battery; `Hibernate` powers off after the write (7.4). Drop-in names must match `NN-name.conf` or UPower ignores them. `sudo systemctl restart upower`, then verify: `upower -d | grep critical-action` → `Hibernate`. The installer's `hibernation` phase writes this file.
 
 ---
 
@@ -542,6 +559,7 @@ HandleLidSwitchExternalPower=suspend-then-hibernate
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
 | `/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` | `HibernateMode=shutdown`: plain power-off after hibernate instead of ACPI S4 (7.4) |
+| `/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` | `CriticalPowerAction=Hibernate`, `PercentageAction=5`: hibernate at 5 % while awake (7.7) |
 | `/usr/lib/systemd/system-sleep/applespi` | `pre`: detach `applespi` + `brcmfmac`; `post`: reattach `applespi`, spawn detached `applespi-wifi-resume` unit (root-port power cycle; only if NM doesn't recover: restart supplicant/NM + trigger the user unit) |
 | `~/.local/bin/shell-refresh-on-resume` | fallback only: wait for unlock, then `omarchy-restart-shell` |
 | `~/.config/systemd/user/shell-refresh-on-resume.service` | user unit wrapping the script; started by the hook via `systemctl --user --machine=` |
