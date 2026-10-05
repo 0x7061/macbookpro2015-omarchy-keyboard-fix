@@ -1,6 +1,6 @@
 # MacBookPro12,1 — built-in keyboard & trackpad on Omarchy (applespi fix)
 
-Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. State as of 22 Sept 2026.
+Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. State as of 5 Oct 2026.
 
 ---
 
@@ -273,7 +273,7 @@ sudo dmesg | grep -iE "acpi_call|modeswitch"     # both at ~1–3 s, not ~12 s
 
 ### 5.5 Incident 23 Sep – 3 Oct 2026: keyboard dead at the LUKS prompt after hibernate
 
-Hibernated at 77 % (23 Sep 09:50, suspend-then-hibernate). On the next power-on the built-in keyboard did not react at the LUKS prompt; the machine was left alone for days. On 3 Oct it booted normally and resumed fine, but at 1.3 %. A hibernated (off) Mac does not use ~49 Wh in 10 days → it sat powered on at the LUKS prompt for hours. The failed boot itself left no log (never got past LUKS → nothing written to the journal; a successful resume replaces the early-boot kernel log). Config and initramfs were unchanged and `applespi` had never logged an error → one-off failure in the early hook, not a broken setup. Response: retry + watchdog + logging in 5.2. If it happens without the watchdog: hold power to force off and cold-boot again, don't close the lid on the prompt.
+Hibernated at 77 % (23 Sep 09:50). On the next power-on the built-in keyboard did not react at the LUKS prompt; the machine was left alone for days. On 3 Oct it booted normally and resumed fine, but at 1.3 %. A hibernated (off) Mac does not use ~49 Wh in 10 days → it sat powered on at the LUKS prompt for hours. The failed boot itself left no log (never got past LUKS → nothing written to the journal; a successful resume replaces the early-boot kernel log). Config and initramfs were unchanged and `applespi` had never logged an error → one-off failure in the early hook, not a broken setup. Response: retry + watchdog + logging in 5.2. If it happens without the watchdog: hold power to force off and cold-boot again, don't close the lid on the prompt.
 
 ---
 
@@ -299,7 +299,7 @@ Constraints the hook is built around:
 3. After hibernate the BCM43602 comes back dead. A driver reload is not enough: the PCIe root port above it (`00:1c.2`, found via PCI class `0x028000`) must be removed and rescanned. NetworkManager then sees a hot-plug and reconnects on its own.
 4. Restarting NetworkManager breaks the Omarchy shell's network widget (Quickshell's `Quickshell.Networking` D-Bus model does not re-attach; the bar shows "NOT CONNECTED" while `nmcli` is connected). The only repair is `omarchy-restart-shell`, which flickers the screen and refuses to run while the session is locked → restart NM + shell only as a fallback, and only after the unlock.
 5. systemd keeps `user.slice`, including the lock screen, frozen until every sleep hook has returned → `post` does nothing slow; the Wi-Fi recovery runs detached via `systemd-run` (a `&` background job would be killed with `systemd-sleep`).
-6. `suspend-then-hibernate` runs `post` → `pre` within ~300 ms at the s2idle → hibernate transition → `pre` stops a running Wi-Fi recovery and retries the `brcmfmac` unload (the module is "in use" while its firmware loads).
+6. A lid shut again right after a wake runs `post` → `pre` back to back → `pre` stops a running Wi-Fi recovery and retries the `brcmfmac` unload (the module is "in use" while its firmware loads).
 7. The shell restart runs as a user unit started with `systemctl --user --machine=<user>@.host`, because the user manager already carries the Hyprland environment. `omarchy-restart-shell`, not `omarchy-refresh-shell` (the latter resets `~/.config/omarchy/shell.json` to defaults first).
 
 Resulting design (three pieces):
@@ -343,8 +343,7 @@ nm_wifi_ok() { nmcli -t -f TYPE,STATE device 2>/dev/null | grep -qE '^wifi:(disc
 
 case "$1" in
     pre)
-        # suspend-then-hibernate runs post -> pre within 300 ms at the s2idle -> hibernate transition;
-        # don't race a running recovery
+        # a lid shut again right after a wake runs post -> pre back to back; don't race a running recovery
         systemctl stop "$WIFI_UNIT.service" 2>/dev/null
         modprobe -r applespi
         # brcmfmac is "in use" while its firmware is still loading (rescan autoloads it), so retry briefly
@@ -439,7 +438,9 @@ Manual Wi-Fi recovery (same steps as the hook, including the shell restart): `su
 
 Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo cat /sys/kernel/debug/wakeup_sources` (event counts), and the journal grep above. `Some devices failed to suspend` / `Failed to put system to sleep` means a device refusing to suspend, not a wake source.
 
-Trade-off: s2idle drains ~10 %/day closed. Shut down for long stretches, or use hibernation (section 7; needs a disk-backed swapfile with non-negative priority, zram alone won't hibernate).
+Lid close is a plain suspend, the logind default; no drop-in under `/etc/systemd/logind.conf.d/` sets `HandleLidSwitch`. Verify: `busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch` → `s "suspend"`.
+
+Trade-off: s2idle drains ~10 %/day closed, and nothing watches the battery while suspended, so shut down for long stretches. Hibernation (section 7) is only the low-battery action while awake (7.6), not a routine sleep state: its power-off is not reliable on this machine (7.5).
 
 ---
 
@@ -514,26 +515,13 @@ The default (`platform`) enters ACPI S4 after writing the image, which keeps wak
 
 Symptom: the image is written fine, but the machine restarts itself within about a minute of the power-off and is found at the LUKS prompt (Apple logo lit with the lid shut). Entering the passphrase restores the session, so hibernation itself is not the problem. Not caused by ACPI wake sources or the sleep path.
 
-**Fix: SMC reset** (22 Sept 2026). Shut down, hold left Shift + Control + Option together with the power button for 10 s, release, then power on. Every hibernate since has stayed off. If it ever comes back, the next step is an NVRAM reset (Cmd + Option + P + R held through two chimes).
+**Fix: SMC reset** (22 Sept 2026). Shut down, hold left Shift + Control + Option together with the power button for 10 s, release, then power on. That held until 5 Oct 2026, when a hibernated machine was again found powered on: hot in a backpack with the screen dark, 36 % of the battery gone in 2 h (~13 W, i.e. fully on), session resumed fine afterwards. Whether it restarted itself or never finished powering off is not known (nothing after the snapshot is logged, 7.3). Next step if hibernation is to be trusted again: repeat the SMC reset, then an NVRAM reset (Cmd + Option + P + R held through two chimes).
+
+Consequence: hibernate is not used as a routine sleep state. Lid close is a plain suspend (section 6); hibernate remains only as the low-battery action while awake (7.6), where the alternative is losing the session anyway.
 
 To test a cycle: `sudo systemctl hibernate`, touch nothing for 2 minutes and watch. Back at the LUKS prompt by itself = failure; still dark = good. The power-off is never logged (see 7.3), so only watched cycles count; `mbp-hib-report` (`~/.local/bin`) lists the cycles of the current boot with their entry→resume gap.
 
-### 7.6 Optional: suspend-then-hibernate on lid close
-
-```ini
-# /etc/systemd/sleep.conf.d/hibernate-delay.conf
-[Sleep]
-HibernateDelaySec=1h
-
-# /etc/systemd/logind.conf.d/lid.conf
-[Login]
-HandleLidSwitch=suspend-then-hibernate
-HandleLidSwitchExternalPower=suspend-then-hibernate
-```
-
-`sudo systemctl restart systemd-logind` (logs you out) or reboot. Hibernation then starts on whichever comes first: `HibernateDelaySec` elapsed, or the battery dropping below 5 % (systemd arms the ACPI battery alarm, `/sys/class/power_supply/BAT0/alarm`, as a wake source; not yet observed firing on this machine). `HibernateDelaySec` is therefore an upper bound, not the only trigger; without it the machine would stay in s2idle until the 5 % alarm. For comparison, macOS writes the image at every sleep and powers RAM off after 3 h. The sleep hooks run around **both** sleep operations: `pre` → s2idle → `post` → (RTC wake after `HibernateDelaySec`) → `pre` again within ~300 ms → hibernate → `post`; the hook's `pre` handles that (6.2). The RTC wake needs `cat /sys/module/rtc_cmos/parameters/use_acpi_alarm` → `Y`; on this machine the driver enables it by itself. Only add `rtc_cmos.use_acpi_alarm=1` to the cmdline if it reads `N`.
-
-### 7.7 Battery empty while awake: hibernate
+### 7.6 Battery empty while awake: hibernate
 
 ```ini
 # /etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf
@@ -544,6 +532,8 @@ CriticalPowerAction=Hibernate
 ```
 
 UPower acts when the battery reaches `PercentageAction`; 5 % instead of the default 2 % leaves an aged battery enough charge to write the image. UPower requires `PercentageLow` > `PercentageCritical` > `PercentageAction` and silently falls back to its defaults (20/5/2) otherwise, hence `PercentageCritical=10`. Its default action `Auto` prefers HybridSleep, which writes the image but then stays in s2idle on an empty battery; `Hibernate` powers off after the write (7.4). Drop-in names must match `NN-name.conf` or UPower ignores them. `sudo systemctl restart upower`, then verify: `upower -d | grep critical-action` → `Hibernate`. The installer's `hibernation` phase writes this file.
+
+This only covers a running machine. In s2idle nothing watches the battery: a suspended machine left long enough runs flat and the session is lost.
 
 ---
 
@@ -559,7 +549,7 @@ UPower acts when the battery reaches `PercentageAction`; 5 % instead of the defa
 | `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
 | `/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` | `HibernateMode=shutdown`: plain power-off after hibernate instead of ACPI S4 (7.4) |
-| `/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` | `CriticalPowerAction=Hibernate`, `PercentageAction=5`: hibernate at 5 % while awake (7.7) |
+| `/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` | `CriticalPowerAction=Hibernate`, `PercentageAction=5`: hibernate at 5 % while awake (7.6) |
 | `/usr/lib/systemd/system-sleep/applespi` | `pre`: detach `applespi` + `brcmfmac`; `post`: reattach `applespi`, spawn detached `applespi-wifi-resume` unit (root-port power cycle; only if NM doesn't recover: restart supplicant/NM + trigger the user unit) |
 | `~/.local/bin/shell-refresh-on-resume` | fallback only: wait for unlock, then `omarchy-restart-shell` |
 | `~/.config/systemd/user/shell-refresh-on-resume.service` | user unit wrapping the script; started by the hook via `systemctl --user --machine=` |
@@ -596,9 +586,10 @@ UPower acts when the battery reaches `PercentageAction`; 5 % instead of the defa
 | lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
 | Wi-Fi dead after hibernate: `wpa_supplicant: Failed to initialize driver interface`, NM `unavailable` then "giving up" | card not really reset by driver reload | root-port remove/rescan + restart `wpa_supplicant NetworkManager` (6.2) |
 | bar shows "NOT CONNECTED" but `nmcli` connected | Quickshell network widget lost NetworkManager when it was restarted | `omarchy-restart-shell` (automated as fallback, 6.2); check `sudo journalctl -b -u applespi-wifi-resume` |
-| `modprobe: FATAL: Module brcmfmac is in use` at the s2idle → hibernate transition | `post` → `pre` back-to-back, driver still loading firmware | `pre` stops `applespi-wifi-resume` and retries the unload (6.2) |
+| `modprobe: FATAL: Module brcmfmac is in use` when the lid is shut again right after a wake | `post` → `pre` back-to-back, driver still loading firmware | `pre` stops `applespi-wifi-resume` and retries the unload (6.2) |
 | `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
-| hibernated Mac found powered on at the LUKS prompt (Apple logo lit with the lid shut) | power-off after the image write did not stick (SMC state, not a wake source or the sleep path) | SMC reset (7.5); NVRAM reset if it recurs |
+| hibernated Mac found powered on (at the LUKS prompt with the Apple logo lit, or dark and hot) | power-off after the image write did not stick (SMC state, not a wake source or the sleep path) | SMC reset (7.5), then NVRAM reset; hibernate is kept off the lid for this reason |
+| lid close hibernates instead of suspending | leftover `HandleLidSwitch=` drop-in in `/etc/systemd/logind.conf.d/` | remove it, reboot; `--verify` checks this |
 | `resume_offset` wrong after recreating swapfile | offset not recomputed | `btrfs inspect-internal map-swapfile -r`, update resume.conf, `limine-update` |
 
 ---
