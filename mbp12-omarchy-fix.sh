@@ -340,8 +340,7 @@ nm_wifi_ok() { nmcli -t -f TYPE,STATE device 2>/dev/null | grep -qE '^wifi:(disc
 
 case "$1" in
     pre)
-        # suspend-then-hibernate runs post -> pre within 300 ms at the s2idle -> hibernate transition;
-        # don't race a running recovery
+        # a lid shut again right after a wake runs post -> pre back to back; don't race a running recovery
         systemctl stop "$WIFI_UNIT.service" 2>/dev/null
         modprobe -r applespi
         # brcmfmac is "in use" while its firmware is still loading (rescan autoloads it), so retry briefly
@@ -484,10 +483,10 @@ EOF
   [[ $can == '"yes"' ]] && ok "logind CanHibernate = yes" || warn "logind CanHibernate = ${can:-?} (re-check after reboot)"
 
   # Battery empty while awake: UPower acts at PercentageAction. Its default "Auto" prefers
-  # HybridSleep, which keeps RAM powered on an empty battery; hibernate instead (README 7.7).
+  # HybridSleep, which keeps RAM powered on an empty battery; hibernate instead (README 7.6).
   # 5 % instead of the default 2 % leaves an aged battery enough charge to write the image.
   # UPower needs Low > Critical > Action or it falls back to its defaults, hence Critical=10.
-  # Asleep is covered by systemd itself: suspend-then-hibernate wakes on the ACPI battery alarm (< 5 %).
+  # Awake only: nothing watches the battery in s2idle, a suspended machine left long enough runs flat.
   write_file "$UPOWER_CONF" 644 <<'EOF'
 [UPower]
 PercentageCritical=10.0
@@ -546,6 +545,10 @@ phase_verify() {
     warn "no 'applespi-force:' lines in this boot's kernel log (hook predates the retry version, or not rebooted yet)"
   fi
   chk "mem_sleep is s2idle"             "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
+  # hibernate is the low-battery action only (README 7.5): no drop-in may turn the lid into a hibernate trigger
+  chk "lid close is plain suspend"        "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch) == 's \"suspend\"' ]]"
+  # unset ("") means logind follows HandleLidSwitch on AC
+  chk "lid close on AC is plain suspend"  "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitchExternalPower) =~ ^s\ \\\"(suspend)?\\\"\$ ]]"
   chk "sleep hook executable"             "[[ -x $SLEEP_HOOK ]]"
   chk "Wi-Fi card visible on PCI (class 0x028000)" "grep -lxq 0x028000 /sys/bus/pci/devices/*/class"
   chk "sleep hook is the detached-recovery version" "grep -q 'wifi-resume)' $SLEEP_HOOK"
