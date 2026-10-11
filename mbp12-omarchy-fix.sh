@@ -11,6 +11,8 @@
 #   sleep          s2idle drop-in + system-sleep hook (applespi/brcmfmac detach; on resume applespi is
 #                  reattached immediately, Wi-Fi card remove/rescan + supplicant/NM restart run detached)
 #                  + user unit that restarts the Omarchy shell once the session is unlocked
+#   trackpad       libinput quirk marking the SPI keyboard as internal, so the trackpad is disabled
+#                  while typing (palm touches are ignored)
 #   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset,
 #                  lid close = suspend, then hibernate after 30 min; hibernate at 5 % battery while
 #                  awake (UPower default: 2 %, hybrid sleep)
@@ -47,6 +49,7 @@ LID_CONF="/etc/systemd/logind.conf.d/30-mac-lid-hibernate.conf"
 HIBERNATE_DELAY="30min"   # lid shut this long in s2idle -> hibernate
 UPOWER_CONF="/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf"   # name must match NN-name.conf
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/applespi"
+QUIRKS_FILE="/etc/libinput/local-overrides.quirks"   # the one override file libinput reads
 SHELL_REFRESH_SCRIPT="$HOME/.local/bin/shell-refresh-on-resume"
 SHELL_REFRESH_UNIT="$HOME/.config/systemd/user/shell-refresh-on-resume.service"
 LIMINE_CONF="/etc/default/limine"
@@ -67,7 +70,7 @@ while [[ $# -gt 0 ]]; do
     --force-model) FORCE_MODEL=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
     --swap-size) SWAP_SIZE="${2:?--swap-size needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -415,6 +418,20 @@ EOF
   [[ $ms == *"[s2idle]"* ]] && ok "mem_sleep: $ms" || warn "mem_sleep is '$ms' — becomes [s2idle] after reboot"
 }
 
+phase_trackpad() {
+  step "Trackpad: disable while typing"
+  # libinput's stock rule for this keyboard expects vendor 0x05AC, but applespi reports vendor 0, so the
+  # keyboard is not known to be internal and disable-while-typing never pairs it with the trackpad
+  write_file "$QUIRKS_FILE" 644 <<'EOF'
+[Apple SPI Keyboard (applespi reports vendor 0)]
+MatchUdevType=keyboard
+MatchBus=spi
+MatchName=Apple SPI Keyboard
+AttrKeyboardIntegration=internal
+EOF
+  if (( WROTE )); then warn "takes effect at the next login (the compositor reads quirks when it starts)"; fi
+}
+
 phase_hibernation() {
   step "Hibernation: top-level @swap subvolume"
   [[ -f $RESUME_DROPIN && -f $OMARCHY_RESUME_CONF ]] \
@@ -574,6 +591,9 @@ phase_verify() {
   chk "omarchy-restart-shell available"   "command -v omarchy-restart-shell >/dev/null"
   chk "omarchy-hyprland-session-locked available" "command -v omarchy-hyprland-session-locked >/dev/null"
   chk "last Wi-Fi recovery did not fail"  "! systemctl is-failed -q applespi-wifi-resume.service"
+  # without the tag libinput never disables the trackpad while typing
+  local kbd; kbd=$(grep -lx 'Apple SPI Keyboard' /sys/class/input/event*/device/name 2>/dev/null | head -1 | cut -d/ -f5)
+  chk "built-in keyboard tagged internal (trackpad off while typing)" "[[ -n '$kbd' ]] && libinput quirks list /dev/input/$kbd 2>/dev/null | grep -qx 'AttrKeyboardIntegration=internal'"
   if [[ -f $RESUME_DROPIN ]]; then
     chk "swap subvolume is top-level @swap" "sudo btrfs subvolume list / | awk -v s=$SWAP_SUBVOL '\$NF==s && \$7==\"5\"{f=1} END{exit !f}'"
     chk "swapfile active with PRIO >= 0"    "swapon --show=NAME,PRIO --noheadings | awk -v f=$SWAP_FILE '\$1==f && \$2>=0{f2=1} END{exit !f2}'"
@@ -597,14 +617,15 @@ phase_preflight
 if (( VERIFY_ONLY )) || [[ $PHASE == verify ]]; then phase_verify && exit 0 || exit 1; fi
 
 case "$PHASE" in
-  all)          phase_kernel_params; phase_acpi_call; phase_switch; phase_initramfs; phase_sleep; phase_rebuild ;;
+  all)          phase_kernel_params; phase_acpi_call; phase_switch; phase_initramfs; phase_sleep; phase_trackpad; phase_rebuild ;;
   kernel-params) phase_kernel_params; phase_rebuild ;;
   acpi-call)    phase_acpi_call ;;
   switch)       phase_acpi_call; phase_switch ;;
   initramfs)    phase_initramfs; phase_rebuild ;;
   sleep)        phase_sleep ;;
+  trackpad)     phase_trackpad ;;
   hibernation)  phase_hibernation; phase_rebuild ;;
-  *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|verify)" ;;
+  *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|trackpad|hibernation|verify)" ;;
 esac
 
 echo
