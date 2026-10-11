@@ -12,9 +12,8 @@
 #                  reattached immediately, Wi-Fi card remove/rescan + supplicant/NM restart run detached)
 #                  + user unit that restarts the Omarchy shell once the session is unlocked
 #   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset,
-#                  hibernate at 5 % battery while awake (UPower default: 2 %, hybrid sleep)
-#   shutdown-trace (OPT-IN, diagnostic) system-shutdown hook that saves lid state + kernel log tail right
-#                  before the final power-off, for a machine that does not stay off after a shutdown
+#                  lid close = suspend, then hibernate after 30 min; hibernate at 5 % battery while
+#                  awake (UPower default: 2 %, hybrid sleep)
 #   verify         read-only checks; run this after each reboot
 #
 # Usage:
@@ -23,7 +22,6 @@
 #   ./mbp12-omarchy-fix.sh --dry-run       show what would be written/run
 #   ./mbp12-omarchy-fix.sh --phase sleep   run a single phase (preflight always runs first)
 #   ./mbp12-omarchy-fix.sh --phase hibernation [--yes] [--swap-size 18g]
-#   ./mbp12-omarchy-fix.sh --phase shutdown-trace [--remove]
 #   ./mbp12-omarchy-fix.sh --force-model   skip the MacBookPro12,1 check (e.g. MacBook8,1)
 #
 # Run as your normal user (needs sudo; the AUR helper refuses to run as root).
@@ -45,10 +43,10 @@ HOOK_RUNTIME="/etc/initcpio/hooks/applespi-force"
 HOOK_CONF="/etc/mkinitcpio.conf.d/zz-applespi-force.conf"
 SLEEP_CONF="/etc/systemd/sleep.conf.d/mac-s2idle.conf"
 HIBERNATE_CONF="/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf"
+LID_CONF="/etc/systemd/logind.conf.d/30-mac-lid-hibernate.conf"
+HIBERNATE_DELAY="30min"   # lid shut this long in s2idle -> hibernate
 UPOWER_CONF="/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf"   # name must match NN-name.conf
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/applespi"
-SHUTDOWN_HOOK="/usr/lib/systemd/system-shutdown/mbp12-trace"
-SHUTDOWN_TRACE_DIR="/var/lib/mbp12-shutdown-trace"   # not /var/log: that subvolume is unmounted by then
 SHELL_REFRESH_SCRIPT="$HOME/.local/bin/shell-refresh-on-resume"
 SHELL_REFRESH_UNIT="$HOME/.config/systemd/user/shell-refresh-on-resume.service"
 LIMINE_CONF="/etc/default/limine"
@@ -60,7 +58,7 @@ SWAP_SUBVOL="@swap"
 BACKUP_ROOT="/root/mbp12-fix-backups"
 
 # ----------------------------------------------------------------------------- flags
-PHASE="all"; DRY_RUN=0; VERIFY_ONLY=0; FORCE_MODEL=0; ASSUME_YES=0; SWAP_SIZE=""; REMOVE=0
+PHASE="all"; DRY_RUN=0; VERIFY_ONLY=0; FORCE_MODEL=0; ASSUME_YES=0; SWAP_SIZE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --phase) PHASE="${2:?--phase needs a value}"; shift 2 ;;
@@ -68,9 +66,8 @@ while [[ $# -gt 0 ]]; do
     --verify) VERIFY_ONLY=1; shift ;;
     --force-model) FORCE_MODEL=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
-    --remove) REMOVE=1; shift ;;
     --swap-size) SWAP_SIZE="${2:?--swap-size needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -427,11 +424,13 @@ phase_hibernation() {
   ok "root device $root_dev"
 
   # ACPI S4 ("platform") leaves lid/Wi-Fi/AC wake armed; "shutdown" is a plain power-off after the
-  # image write (README 7.4). A Mac that powers itself back on to the LUKS prompt afterwards has a
-  # sleep hook that removes the Wi-Fi root port: re-run --phase sleep (README 7.5).
-  write_file "$HIBERNATE_CONF" 644 <<'EOF'
+  # image write. A Mac that powers itself back on to the LUKS prompt afterwards has a
+  # sleep hook that removes the Wi-Fi root port: re-run --phase sleep.
+  # HibernateDelaySec: without it systemd stays in s2idle until the battery is nearly empty.
+  write_file "$HIBERNATE_CONF" 644 <<EOF
 [Sleep]
 HibernateMode=shutdown
+HibernateDelaySec=$HIBERNATE_DELAY
 EOF
 
   local subvols nested top mounted
@@ -490,10 +489,10 @@ EOF
   [[ $can == '"yes"' ]] && ok "logind CanHibernate = yes" || warn "logind CanHibernate = ${can:-?} (re-check after reboot)"
 
   # Battery empty while awake: UPower acts at PercentageAction. Its default "Auto" prefers
-  # HybridSleep, which keeps RAM powered on an empty battery; hibernate instead (README 7.6).
+  # HybridSleep, which keeps RAM powered on an empty battery; hibernate instead.
   # 5 % instead of the default 2 % leaves an aged battery enough charge to write the image.
   # UPower needs Low > Critical > Action or it falls back to its defaults, hence Critical=10.
-  # Awake only: nothing watches the battery in s2idle, a suspended machine left long enough runs flat.
+  # Awake only: nothing watches the battery in s2idle (the lid setting below covers a shut lid).
   write_file "$UPOWER_CONF" 644 <<'EOF'
 [UPower]
 PercentageCritical=10.0
@@ -501,35 +500,14 @@ PercentageAction=5.0
 CriticalPowerAction=Hibernate
 EOF
   if (( WROTE )); then run systemctl restart upower; fi
-}
 
-phase_shutdown_trace() {
-  step "Shutdown trace hook (diagnostic)"
-  if (( REMOVE )); then
-    run rm -f "$SHUTDOWN_HOOK"; ok "removed $SHUTDOWN_HOOK (traces stay in $SHUTDOWN_TRACE_DIR)"; return 0
-  fi
-  # the quoted heredoc keeps $1 etc. literal; the trace dir is substituted afterwards
-  sed "s|@DIR@|$SHUTDOWN_TRACE_DIR|" <<'EOF' | write_file "$SHUTDOWN_HOOK" 755
-#!/bin/sh
-# MacBookPro12,1 shutdown trace (Omarchy) - diagnostic for a machine that does not stay off after
-# a shutdown (README 7.5). systemd-shutdown runs this as its last step before it asks the kernel
-# to power off; the journal is long closed by then.
-#   trace exists for the failed shutdown -> userspace finished; the fault is in the kernel
-#                                           power-off or after it
-#   no trace for it                      -> it never got this far
-# Everything but / is unmounted here and / is read-only, hence the remount.
-DIR=@DIR@
-mount -o remount,rw / || exit 0
-mkdir -p "$DIR"
-{
-    echo "action=$1 lid=$(awk '{print $2}' /proc/acpi/button/lid/*/state 2>/dev/null) uptime=$(cut -d' ' -f1 /proc/uptime)"
-    dmesg | tail -n 150
-} > "$DIR/$(date +%Y%m%d-%H%M%S).log"
-ls -1t "$DIR"/*.log | tail -n +21 | xargs -r rm -f
-sync
-mount -o remount,ro /
+  # s2idle drains ~10 %/day, so a shut lid hibernates after HibernateDelaySec. On AC logind follows
+  # HandleLidSwitch. SIGHUP makes logind re-read its config without touching the session.
+  write_file "$LID_CONF" 644 <<'EOF'
+[Login]
+HandleLidSwitch=suspend-then-hibernate
 EOF
-  ok "traces go to $SHUTDOWN_TRACE_DIR/<time of shutdown>.log (newest 20 kept); undo with --phase shutdown-trace --remove"
+  if (( WROTE )); then run systemctl kill -s HUP systemd-logind; fi
 }
 
 phase_rebuild() {
@@ -581,14 +559,15 @@ phase_verify() {
     warn "no 'applespi-force:' lines in this boot's kernel log (hook predates the retry version, or not rebooted yet)"
   fi
   chk "mem_sleep is s2idle"             "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
-  # hibernate is the low-battery action only (README 7.6): no drop-in may turn the lid into a hibernate trigger
-  chk "lid close is plain suspend"        "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch) == 's \"suspend\"' ]]"
+  # with hibernation set up the lid suspends, then hibernates; without it, it must stay a plain suspend
+  local lid=suspend; [[ -f $RESUME_DROPIN ]] && lid=suspend-then-hibernate
+  chk "lid close is $lid"                 "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch) == 's \"$lid\"' ]]"
   # unset ("") means logind follows HandleLidSwitch on AC
-  chk "lid close on AC is plain suspend"  "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitchExternalPower) =~ ^s\ \\\"(suspend)?\\\"\$ ]]"
+  chk "lid close on AC is $lid"           "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitchExternalPower) =~ ^s\ \\\"($lid)?\\\"\$ ]]"
   chk "sleep hook executable"             "[[ -x $SLEEP_HOOK ]]"
   chk "Wi-Fi card visible on PCI (class 0x028000)" "grep -lxq 0x028000 /sys/bus/pci/devices/*/class"
   chk "sleep hook is the detached-recovery version" "grep -q 'wifi-resume)' $SLEEP_HOOK"
-  # removing the root port instead makes the next power-off restart itself or hang (README 7.5)
+  # removing the root port instead makes the next power-off restart itself or hang
   chk "sleep hook removes only the Wi-Fi card, not its root port" "grep -q 'dev/remove' $SLEEP_HOOK && ! grep -q 'port/remove' $SLEEP_HOOK"
   chk "shell-refresh script executable"   "[[ -x $SHELL_REFRESH_SCRIPT ]]"
   chk "shell-refresh user unit loaded"    "[[ \$(systemctl --user show -p LoadState --value shell-refresh-on-resume.service) == loaded ]]"
@@ -600,6 +579,7 @@ phase_verify() {
     chk "swapfile active with PRIO >= 0"    "swapon --show=NAME,PRIO --noheadings | awk -v f=$SWAP_FILE '\$1==f && \$2>=0{f2=1} END{exit !f2}'"
     chk "resume_offset matches swapfile"    "[[ \$(sudo btrfs inspect-internal map-swapfile -r $SWAP_FILE) == \$(grep -oE 'resume_offset=[0-9]+' /proc/cmdline | cut -d= -f2) ]]"
     chk "HibernateMode=shutdown (no ACPI S4)" "systemd-analyze cat-config systemd/sleep.conf | grep -qx 'HibernateMode=shutdown'"
+    chk "hibernate after $HIBERNATE_DELAY of suspend" "systemd-analyze cat-config systemd/sleep.conf | grep -qx 'HibernateDelaySec=$HIBERNATE_DELAY'"
     chk "logind CanHibernate = yes"         "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate | grep -q '\"yes\"'"
     chk "UPower critical action is Hibernate" "upower -d | grep -qE 'critical-action:\s+Hibernate'"
     chk "UPower acts at 5 %"                  "grep -qx 'PercentageAction=5.0' $UPOWER_CONF"
@@ -624,8 +604,7 @@ case "$PHASE" in
   initramfs)    phase_initramfs; phase_rebuild ;;
   sleep)        phase_sleep ;;
   hibernation)  phase_hibernation; phase_rebuild ;;
-  shutdown-trace) phase_shutdown_trace ;;
-  *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|shutdown-trace|verify)" ;;
+  *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|verify)" ;;
 esac
 
 echo
