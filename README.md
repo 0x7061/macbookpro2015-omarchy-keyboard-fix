@@ -10,15 +10,15 @@ The keyboard and trackpad are dead out of the box: the firmware puts the topcase
 
 ```bash
 ./mbp12-omarchy-fix.sh --dry-run     # show what would change
-./mbp12-omarchy-fix.sh               # steps 1-5
+./mbp12-omarchy-fix.sh               # steps 1-6
 sudo reboot                          # keep a USB keyboard attached for this first reboot
 ./mbp12-omarchy-fix.sh --verify      # read-only checks
 
-sudo omarchy-hibernation-setup       # optional, step 6: hibernation (recreates the swapfile)
+sudo omarchy-hibernation-setup       # optional, step 7: hibernation (recreates the swapfile)
 ./mbp12-omarchy-fix.sh --phase hibernation [--yes] [--swap-size 18g]
 ```
 
-`--phase <name>` runs one step: `kernel-params`, `acpi-call`, `switch`, `initramfs`, `sleep`, `hibernation`, `verify`.
+`--phase <name>` runs one step: `kernel-params`, `acpi-call`, `switch`, `initramfs`, `sleep`, `trackpad`, `hibernation`, `verify`.
 
 ## Manual steps
 
@@ -301,7 +301,23 @@ chmod 755 ~/.local/bin/shell-refresh-on-resume
 systemctl --user daemon-reload
 ```
 
-### 6. Hibernation (optional)
+### 6. Trackpad: ignore the palm while typing
+
+libinput disables the trackpad while typing only if it knows the keyboard is built in. Its stock rule for this keyboard expects vendor `0x05AC`, but `applespi` reports vendor 0, so the keyboard has to be marked by hand.
+
+`/etc/libinput/local-overrides.quirks`:
+
+```ini
+[Apple SPI Keyboard (applespi reports vendor 0)]
+MatchUdevType=keyboard
+MatchBus=spi
+MatchName=Apple SPI Keyboard
+AttrKeyboardIntegration=internal
+```
+
+Log out and back in (or reboot).
+
+### 7. Hibernation (optional)
 
 `omarchy-hibernation-setup` puts the swapfile in a subvolume nested under `@`, which systemd 259 and later refuses to hibernate into. Move it to a top-level `@swap` subvolume. This deletes and recreates the swapfile.
 
@@ -375,6 +391,7 @@ systemctl is-active applespi-force.service
 cat /sys/power/mem_sleep                                          # [s2idle] deep
 grep -c 'port/remove' /usr/lib/systemd/system-sleep/applespi      # 0
 sudo journalctl -b -u applespi-wifi-resume                        # after a resume: "no restart needed"
+libinput quirks list /dev/input/event6                            # AttrKeyboardIntegration=internal (event number: see /proc/bus/input/devices)
 ```
 
 Hibernation only:
