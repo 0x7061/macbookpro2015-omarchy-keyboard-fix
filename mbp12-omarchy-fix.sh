@@ -9,10 +9,12 @@
 #   switch         /usr/local/bin/applespi-force (UIEN 0 / SIEN 1 / reload applespi) + systemd unit
 #   initramfs      busybox early hook so the keyboard works at the LUKS passphrase prompt
 #   sleep          s2idle drop-in + system-sleep hook (applespi/brcmfmac detach; on resume applespi is
-#                  reattached immediately, Wi-Fi slot power-cycle + supplicant/NM restart run detached)
+#                  reattached immediately, Wi-Fi card remove/rescan + supplicant/NM restart run detached)
 #                  + user unit that restarts the Omarchy shell once the session is unlocked
 #   hibernation    (OPT-IN) move the btrfs swapfile to a top-level @swap subvolume, fix resume_offset,
 #                  hibernate at 5 % battery while awake (UPower default: 2 %, hybrid sleep)
+#   shutdown-trace (OPT-IN, diagnostic) system-shutdown hook that saves lid state + kernel log tail right
+#                  before the final power-off, for a machine that does not stay off after a shutdown
 #   verify         read-only checks; run this after each reboot
 #
 # Usage:
@@ -21,6 +23,7 @@
 #   ./mbp12-omarchy-fix.sh --dry-run       show what would be written/run
 #   ./mbp12-omarchy-fix.sh --phase sleep   run a single phase (preflight always runs first)
 #   ./mbp12-omarchy-fix.sh --phase hibernation [--yes] [--swap-size 18g]
+#   ./mbp12-omarchy-fix.sh --phase shutdown-trace [--remove]
 #   ./mbp12-omarchy-fix.sh --force-model   skip the MacBookPro12,1 check (e.g. MacBook8,1)
 #
 # Run as your normal user (needs sudo; the AUR helper refuses to run as root).
@@ -44,6 +47,8 @@ SLEEP_CONF="/etc/systemd/sleep.conf.d/mac-s2idle.conf"
 HIBERNATE_CONF="/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf"
 UPOWER_CONF="/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf"   # name must match NN-name.conf
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/applespi"
+SHUTDOWN_HOOK="/usr/lib/systemd/system-shutdown/mbp12-trace"
+SHUTDOWN_TRACE_DIR="/var/lib/mbp12-shutdown-trace"   # not /var/log: that subvolume is unmounted by then
 SHELL_REFRESH_SCRIPT="$HOME/.local/bin/shell-refresh-on-resume"
 SHELL_REFRESH_UNIT="$HOME/.config/systemd/user/shell-refresh-on-resume.service"
 LIMINE_CONF="/etc/default/limine"
@@ -55,7 +60,7 @@ SWAP_SUBVOL="@swap"
 BACKUP_ROOT="/root/mbp12-fix-backups"
 
 # ----------------------------------------------------------------------------- flags
-PHASE="all"; DRY_RUN=0; VERIFY_ONLY=0; FORCE_MODEL=0; ASSUME_YES=0; SWAP_SIZE=""
+PHASE="all"; DRY_RUN=0; VERIFY_ONLY=0; FORCE_MODEL=0; ASSUME_YES=0; SWAP_SIZE=""; REMOVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --phase) PHASE="${2:?--phase needs a value}"; shift 2 ;;
@@ -63,8 +68,9 @@ while [[ $# -gt 0 ]]; do
     --verify) VERIFY_ONLY=1; shift ;;
     --force-model) FORCE_MODEL=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
+    --remove) REMOVE=1; shift ;;
     --swap-size) SWAP_SIZE="${2:?--swap-size needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -324,10 +330,12 @@ EOF
 #  post: reattach applespi right away, then hand the slow Wi-Fi recovery to a detached unit.
 #        user.slice (and with it the lock screen) stays frozen until this hook returns, so
 #        nothing slow may run here or keyboard/trackpad/lock screen are dead for seconds.
-#  wifi-resume (run detached via systemd-run): power-cycle the Wi-Fi PCIe slot (BCM43602 comes
-#        back dead after hibernate) and reload brcmfmac. NetworkManager normally treats that as a
-#        hot-plug and reconnects by itself; the bar follows along. Only if NM does not get a working
-#        supplicant interface: restart wpa_supplicant + NetworkManager, which in turn requires
+#  wifi-resume (run detached via systemd-run): remove + rescan the Wi-Fi card (BCM43602 comes
+#        back dead after hibernate) and reload brcmfmac. Only the card, not the root port above
+#        it: removing 0000:00:1c.2 makes the next power-off bounce or hang dark-but-on.
+#        NetworkManager normally treats that as a hot-plug and reconnects by itself; the bar
+#        follows along. Only if NM does not get a working supplicant interface: restart
+#        wpa_supplicant + NetworkManager, which in turn requires
 #        restarting the Omarchy shell (Quickshell's network model does not survive an NM restart,
 #        and the restart flickers the whole screen - hence last resort)
 WIFI_CLASS=0x028000      # PCI class of the BCM43602 (network controller, other)
@@ -356,8 +364,7 @@ case "$1" in
     wifi-resume)
         dev=$(wifi_dev)
         if [ -n "$dev" ]; then
-            port=$(readlink -f "$dev/..")          # PCIe root port above the card (0000:00:1c.2)
-            echo 1 > "$port/remove"
+            echo 1 > "$dev/remove"
             sleep 1
         fi
         echo 1 > /sys/bus/pci/rescan
@@ -420,8 +427,8 @@ phase_hibernation() {
   ok "root device $root_dev"
 
   # ACPI S4 ("platform") leaves lid/Wi-Fi/AC wake armed; "shutdown" is a plain power-off after the
-  # image write (README 7.4). If the Mac still powers itself back on to the LUKS prompt after
-  # hibernate, that is SMC state, not a wake source: do an SMC reset (README 7.5).
+  # image write (README 7.4). A Mac that powers itself back on to the LUKS prompt afterwards has a
+  # sleep hook that removes the Wi-Fi root port: re-run --phase sleep (README 7.5).
   write_file "$HIBERNATE_CONF" 644 <<'EOF'
 [Sleep]
 HibernateMode=shutdown
@@ -496,6 +503,35 @@ EOF
   if (( WROTE )); then run systemctl restart upower; fi
 }
 
+phase_shutdown_trace() {
+  step "Shutdown trace hook (diagnostic)"
+  if (( REMOVE )); then
+    run rm -f "$SHUTDOWN_HOOK"; ok "removed $SHUTDOWN_HOOK (traces stay in $SHUTDOWN_TRACE_DIR)"; return 0
+  fi
+  # the quoted heredoc keeps $1 etc. literal; the trace dir is substituted afterwards
+  sed "s|@DIR@|$SHUTDOWN_TRACE_DIR|" <<'EOF' | write_file "$SHUTDOWN_HOOK" 755
+#!/bin/sh
+# MacBookPro12,1 shutdown trace (Omarchy) - diagnostic for a machine that does not stay off after
+# a shutdown (README 7.5). systemd-shutdown runs this as its last step before it asks the kernel
+# to power off; the journal is long closed by then.
+#   trace exists for the failed shutdown -> userspace finished; the fault is in the kernel
+#                                           power-off or after it
+#   no trace for it                      -> it never got this far
+# Everything but / is unmounted here and / is read-only, hence the remount.
+DIR=@DIR@
+mount -o remount,rw / || exit 0
+mkdir -p "$DIR"
+{
+    echo "action=$1 lid=$(awk '{print $2}' /proc/acpi/button/lid/*/state 2>/dev/null) uptime=$(cut -d' ' -f1 /proc/uptime)"
+    dmesg | tail -n 150
+} > "$DIR/$(date +%Y%m%d-%H%M%S).log"
+ls -1t "$DIR"/*.log | tail -n +21 | xargs -r rm -f
+sync
+mount -o remount,ro /
+EOF
+  ok "traces go to $SHUTDOWN_TRACE_DIR/<time of shutdown>.log (newest 20 kept); undo with --phase shutdown-trace --remove"
+}
+
 phase_rebuild() {
   (( NEEDS_REBUILD )) || { ok "no initramfs/bootloader rebuild needed"; return 0; }
   step "Rebuilding UKI + Limine entries"
@@ -545,13 +581,15 @@ phase_verify() {
     warn "no 'applespi-force:' lines in this boot's kernel log (hook predates the retry version, or not rebooted yet)"
   fi
   chk "mem_sleep is s2idle"             "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
-  # hibernate is the low-battery action only (README 7.5): no drop-in may turn the lid into a hibernate trigger
+  # hibernate is the low-battery action only (README 7.6): no drop-in may turn the lid into a hibernate trigger
   chk "lid close is plain suspend"        "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch) == 's \"suspend\"' ]]"
   # unset ("") means logind follows HandleLidSwitch on AC
   chk "lid close on AC is plain suspend"  "[[ \$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitchExternalPower) =~ ^s\ \\\"(suspend)?\\\"\$ ]]"
   chk "sleep hook executable"             "[[ -x $SLEEP_HOOK ]]"
   chk "Wi-Fi card visible on PCI (class 0x028000)" "grep -lxq 0x028000 /sys/bus/pci/devices/*/class"
   chk "sleep hook is the detached-recovery version" "grep -q 'wifi-resume)' $SLEEP_HOOK"
+  # removing the root port instead makes the next power-off restart itself or hang (README 7.5)
+  chk "sleep hook removes only the Wi-Fi card, not its root port" "grep -q 'dev/remove' $SLEEP_HOOK && ! grep -q 'port/remove' $SLEEP_HOOK"
   chk "shell-refresh script executable"   "[[ -x $SHELL_REFRESH_SCRIPT ]]"
   chk "shell-refresh user unit loaded"    "[[ \$(systemctl --user show -p LoadState --value shell-refresh-on-resume.service) == loaded ]]"
   chk "omarchy-restart-shell available"   "command -v omarchy-restart-shell >/dev/null"
@@ -586,7 +624,8 @@ case "$PHASE" in
   initramfs)    phase_initramfs; phase_rebuild ;;
   sleep)        phase_sleep ;;
   hibernation)  phase_hibernation; phase_rebuild ;;
-  *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|verify)" ;;
+  shutdown-trace) phase_shutdown_trace ;;
+  *) die "unknown phase '$PHASE' (all|kernel-params|acpi-call|switch|initramfs|sleep|hibernation|shutdown-trace|verify)" ;;
 esac
 
 echo
