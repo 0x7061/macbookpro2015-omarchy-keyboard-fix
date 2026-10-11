@@ -1,6 +1,6 @@
 # MacBookPro12,1 — built-in keyboard & trackpad on Omarchy (applespi fix)
 
-Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. State as of 5 Oct 2026.
+Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. State as of 11 Oct 2026.
 
 ---
 
@@ -26,6 +26,7 @@ sudo omarchy-hibernation-setup              # optional: hibernation (opt-in, rec
 | `initramfs` | early hook so the keyboard works at the LUKS prompt, rebuild | 5 |
 | `sleep` | s2idle drop-in, sleep hook, `shell-refresh-on-resume` user script + unit | 6 |
 | `hibernation` | **opt-in, destructive for the swapfile:** move it to a top-level `@swap` subvolume, fix `resume_offset` | 7 |
+| `shutdown-trace` | **opt-in, diagnostic:** system-shutdown hook that saves lid state + kernel log tail to `/var/lib/mbp12-shutdown-trace/` right before the final power-off, for a machine that does not stay off; `--remove` uninstalls it | 7.5 |
 | `verify` | same as `--verify` | — |
 
 Other flags: `--force-model` skips the `MacBookPro12,1` check (e.g. to try it on a MacBook8,1), `--help` prints the usage header.
@@ -296,7 +297,7 @@ Constraints the hook is built around:
 
 1. `applespi` wedges across sleep → unload in `pre`, reload in `post`.
 2. `brcmfmac` refuses to enter D3 (`-5`), which aborts the suspend and makes systemd retry in a loop (lid logo blinks every few seconds) → unload in `pre`.
-3. After hibernate the BCM43602 comes back dead. A driver reload is not enough: the PCIe root port above it (`00:1c.2`, found via PCI class `0x028000`) must be removed and rescanned. NetworkManager then sees a hot-plug and reconnects on its own.
+3. After hibernate the BCM43602 comes back dead. A driver reload is not enough: the card (`03:00.0`, found via PCI class `0x028000`) must be removed and rescanned. Remove only the card, not the PCIe root port above it (`00:1c.2`): after a root-port remove the machine no longer stays off at the next power-off (7.5). NetworkManager then sees a hot-plug and reconnects on its own.
 4. Restarting NetworkManager breaks the Omarchy shell's network widget (Quickshell's `Quickshell.Networking` D-Bus model does not re-attach; the bar shows "NOT CONNECTED" while `nmcli` is connected). The only repair is `omarchy-restart-shell`, which flickers the screen and refuses to run while the session is locked → restart NM + shell only as a fallback, and only after the unlock.
 5. systemd keeps `user.slice`, including the lock screen, frozen until every sleep hook has returned → `post` does nothing slow; the Wi-Fi recovery runs detached via `systemd-run` (a `&` background job would be killed with `systemd-sleep`).
 6. A lid shut again right after a wake runs `post` → `pre` back to back → `pre` stops a running Wi-Fi recovery and retries the `brcmfmac` unload (the module is "in use" while its firmware loads).
@@ -309,7 +310,7 @@ systemd-sleep ─post─▶ hook "post":  applespi-force                       k
                                     systemd-run --unit=applespi-wifi-resume "$0" wifi-resume   (detached, returns at once)
               ─thaw user.slice ───▶ lock screen responsive immediately
 
-applespi-wifi-resume.service (root): remove root port → rescan → modprobe brcmfmac → poll for wl* → udevadm settle
+applespi-wifi-resume.service (root): remove Wi-Fi card → rescan → modprobe brcmfmac → poll for wl* → udevadm settle
                                      → wait ≤ 8 s for NM to report the Wi-Fi device as usable (not "unavailable")
                                        ├─ yes (normal): done. NM reconnects itself, bar icon follows. No flicker.
                                        └─ no (fallback): restart wpa_supplicant NetworkManager
@@ -327,10 +328,12 @@ shell-refresh-on-resume.service (user, fallback only): wait until unlocked (poll
 #  post: reattach applespi right away, then hand the slow Wi-Fi recovery to a detached unit.
 #        user.slice (and with it the lock screen) stays frozen until this hook returns, so
 #        nothing slow may run here or keyboard/trackpad/lock screen are dead for seconds.
-#  wifi-resume (run detached via systemd-run): power-cycle the Wi-Fi PCIe slot (BCM43602 comes
-#        back dead after hibernate) and reload brcmfmac. NetworkManager normally treats that as a
-#        hot-plug and reconnects by itself; the bar follows along. Only if NM does not get a working
-#        supplicant interface: restart wpa_supplicant + NetworkManager, which in turn requires
+#  wifi-resume (run detached via systemd-run): remove + rescan the Wi-Fi card (BCM43602 comes
+#        back dead after hibernate) and reload brcmfmac. Only the card, not the root port above
+#        it: removing 0000:00:1c.2 makes the next power-off bounce or hang dark-but-on.
+#        NetworkManager normally treats that as a hot-plug and reconnects by itself; the bar
+#        follows along. Only if NM does not get a working supplicant interface: restart
+#        wpa_supplicant + NetworkManager, which in turn requires
 #        restarting the Omarchy shell (Quickshell's network model does not survive an NM restart,
 #        and the restart flickers the whole screen - hence last resort)
 WIFI_CLASS=0x028000      # PCI class of the BCM43602 (network controller, other)
@@ -359,8 +362,7 @@ case "$1" in
     wifi-resume)
         dev=$(wifi_dev)
         if [ -n "$dev" ]; then
-            port=$(readlink -f "$dev/..")          # PCIe root port above the card (0000:00:1c.2)
-            echo 1 > "$port/remove"
+            echo 1 > "$dev/remove"
             sleep 1
         fi
         echo 1 > /sys/bus/pci/rescan
@@ -432,7 +434,7 @@ journalctl -b --user-unit shell-refresh-on-resume       # shell restart (fallbac
 sudo journalctl -b -t systemd-sleep                     # hook errors
 ```
 
-Tunable: `sleep 1` after removing the root port. If Wi-Fi ever stays dead after hibernate, raise it to `sleep 2`; it only delays Wi-Fi, not input.
+Tunable: `sleep 1` after removing the card. If Wi-Fi ever stays dead after hibernate, raise it to `sleep 2`; it only delays Wi-Fi, not input.
 
 Manual Wi-Fi recovery (same steps as the hook, including the shell restart): `sudo /usr/lib/systemd/system-sleep/applespi wifi-resume`.
 
@@ -440,7 +442,7 @@ Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo ca
 
 Lid close is a plain suspend, the logind default; no drop-in under `/etc/systemd/logind.conf.d/` sets `HandleLidSwitch`. Verify: `busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch` → `s "suspend"`.
 
-Trade-off: s2idle drains ~10 %/day closed, and nothing watches the battery while suspended, so shut down for long stretches. Hibernation (section 7) is only the low-battery action while awake (7.6), not a routine sleep state: its power-off is not reliable on this machine (7.5).
+Trade-off: s2idle drains ~10 %/day closed, and nothing watches the battery while suspended, so shut down for long stretches. Hibernation (section 7) is only the low-battery action while awake (7.6), not a routine sleep state.
 
 ---
 
@@ -511,15 +513,23 @@ HibernateMode=shutdown
 
 The default (`platform`) enters ACPI S4 after writing the image, which keeps wake sources armed (`/proc/acpi/wakeup`: `LID0` and `ARPT` are S4-capable). `shutdown` does a plain power-off after the image is written. Verify: `cat /sys/power/disk` → `[shutdown]`. Takes effect on the next sleep (`systemd-sleep` reads the config each time). The installer's `hibernation` phase writes this file.
 
-### 7.5 Mac does not stay off after hibernate → SMC reset
+### 7.5 Mac does not stay off after a power-off → card-only remove in the sleep hook
 
-Symptom: the image is written fine, but the machine restarts itself within about a minute of the power-off and is found at the LUKS prompt (Apple logo lit with the lid shut). Entering the passphrase restores the session, so hibernation itself is not the problem. Not caused by ACPI wake sources or the sleep path.
+Symptom: after `systemctl poweroff` or a hibernate from a session that had resumed from sleep at least once, the machine either restarts itself 30-50 s later and sits at the LUKS prompt (Apple logo lit with the lid shut), or stays dark but powered: warm, short presses of the power button do nothing, a 5-6 s hold followed by a normal press boots it. Sessions that never slept power off properly.
 
-**Fix: SMC reset** (22 Sept 2026). Shut down, hold left Shift + Control + Option together with the power button for 10 s, release, then power on. That held until 5 Oct 2026, when a hibernated machine was again found powered on: hot in a backpack with the screen dark, 36 % of the battery gone in 2 h (~13 W, i.e. fully on), session resumed fine afterwards. Whether it restarted itself or never finished powering off is not known (nothing after the snapshot is logged, 7.3). Next step if hibernation is to be trusted again: repeat the SMC reset, then an NVRAM reset (Cmd + Option + P + R held through two chimes).
+Cause: until 11 Oct 2026 the sleep hook revived Wi-Fi on resume by removing the PCIe root port above the card (`00:1c.2`) and rescanning. After that remove the kernel still runs the whole shutdown and reaches `reboot: Power down`, but the machine does not go down. Why the firmware reacts that way is not known. Ruled out by test: ACPI wake sources (all disabled, same result), the `applespi` and `brcmfmac` reloads, and the sleep itself (the hook's Wi-Fi part run by hand on a fresh boot reproduces it). An SMC reset (22 Sept 2026) did not cure it.
 
-Consequence: hibernate is not used as a routine sleep state. Lid close is a plain suspend (section 6); hibernate remains only as the low-battery action while awake (7.6), where the alternative is losing the session anyway.
+**Fix: remove only the card** (6.2; `./mbp12-omarchy-fix.sh --phase sleep` installs the current hook). Watched power-offs on 11 Oct 2026: 6 of 6 failed with the root-port remove, 3 of 3 were proper with the card-only remove, two of those after a real suspend. Wi-Fi came back after suspend and after one hibernate cycle. A hibernate from a session with earlier suspends has not been re-tested.
 
-To test a cycle: `sudo systemctl hibernate`, touch nothing for 2 minutes and watch. Back at the LUKS prompt by itself = failure; still dark = good. The power-off is never logged (see 7.3), so only watched cycles count; `mbp-hib-report` (`~/.local/bin`) lists the cycles of the current boot with their entry→resume gap.
+```bash
+grep -c 'port/remove' /usr/lib/systemd/system-sleep/applespi   # want: 0 (also checked by --verify)
+lspci -vs 00:1c.2 | grep 'Memory behind'                       # c1000000-c14fffff = port untouched since boot;
+                                                               # 90000000-904fffff = it was removed, power-off will fail
+```
+
+To test a cycle: close the lid for a minute, open it, `systemctl poweroff` (or `sudo systemctl hibernate`), touch nothing for 2 minutes and watch. Back at the LUKS prompt by itself, or a single short press does not boot it = failure. The power-off is never logged (see 7.3), so only watched cycles count; `--phase shutdown-trace` saves the last kernel lines of each shutdown, and `mbp-hib-report` (`~/.local/bin`) lists the hibernate cycles of the current boot with their entry→resume gap.
+
+Lid close stays a plain suspend (section 6); hibernate remains the low-battery action while awake (7.6).
 
 ### 7.6 Battery empty while awake: hibernate
 
@@ -550,7 +560,7 @@ This only covers a running machine. In s2idle nothing watches the battery: a sus
 | `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
 | `/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` | `HibernateMode=shutdown`: plain power-off after hibernate instead of ACPI S4 (7.4) |
 | `/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` | `CriticalPowerAction=Hibernate`, `PercentageAction=5`: hibernate at 5 % while awake (7.6) |
-| `/usr/lib/systemd/system-sleep/applespi` | `pre`: detach `applespi` + `brcmfmac`; `post`: reattach `applespi`, spawn detached `applespi-wifi-resume` unit (root-port power cycle; only if NM doesn't recover: restart supplicant/NM + trigger the user unit) |
+| `/usr/lib/systemd/system-sleep/applespi` | `pre`: detach `applespi` + `brcmfmac`; `post`: reattach `applespi`, spawn detached `applespi-wifi-resume` unit (Wi-Fi card remove/rescan; only if NM doesn't recover: restart supplicant/NM + trigger the user unit) |
 | `~/.local/bin/shell-refresh-on-resume` | fallback only: wait for unlock, then `omarchy-restart-shell` |
 | `~/.config/systemd/user/shell-refresh-on-resume.service` | user unit wrapping the script; started by the hook via `systemctl --user --machine=` |
 | `/etc/fstab` | `@swap` subvolume mounted at `/swap` + swapfile with `pri=0` |
@@ -584,11 +594,11 @@ This only covers a running machine. In s2idle nothing watches the battery: a sus
 | `acpi_call` first loads at ~12 s, keyboard dead at LUKS | hook not in initramfs (drop-in clobbered) | `zz-` drop-in name, rebuild, check for build-hook line |
 | keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
 | lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
-| Wi-Fi dead after hibernate: `wpa_supplicant: Failed to initialize driver interface`, NM `unavailable` then "giving up" | card not really reset by driver reload | root-port remove/rescan + restart `wpa_supplicant NetworkManager` (6.2) |
+| Wi-Fi dead after hibernate: `wpa_supplicant: Failed to initialize driver interface`, NM `unavailable` then "giving up" | card not really reset by driver reload | card remove/rescan + restart `wpa_supplicant NetworkManager` (6.2) |
 | bar shows "NOT CONNECTED" but `nmcli` connected | Quickshell network widget lost NetworkManager when it was restarted | `omarchy-restart-shell` (automated as fallback, 6.2); check `sudo journalctl -b -u applespi-wifi-resume` |
 | `modprobe: FATAL: Module brcmfmac is in use` when the lid is shut again right after a wake | `post` → `pre` back-to-back, driver still loading firmware | `pre` stops `applespi-wifi-resume` and retries the unload (6.2) |
 | `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
-| hibernated Mac found powered on (at the LUKS prompt with the Apple logo lit, or dark and hot) | power-off after the image write did not stick (SMC state, not a wake source or the sleep path) | SMC reset (7.5), then NVRAM reset; hibernate is kept off the lid for this reason |
+| after a shutdown or hibernate the Mac restarts itself within a minute (LUKS prompt, Apple logo lit), or stays dark but warm and needs a 5-6 s hold of the power button | an old sleep hook removed the Wi-Fi PCIe root port `00:1c.2` on resume; the next power-off then does not take the machine down | `--phase sleep` installs the card-only hook (7.5); `--verify` checks it |
 | lid close hibernates instead of suspending | leftover `HandleLidSwitch=` drop-in in `/etc/systemd/logind.conf.d/` | remove it, reboot; `--verify` checks this |
 | `resume_offset` wrong after recreating swapfile | offset not recomputed | `btrfs inspect-internal map-swapfile -r`, update resume.conf, `limine-update` |
 
