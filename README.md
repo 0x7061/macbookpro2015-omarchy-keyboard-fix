@@ -333,11 +333,19 @@ OFF=$(sudo btrfs inspect-internal map-swapfile -r /swap/swapfile)
 sudo sed -i "s/resume_offset=[0-9]*/resume_offset=$OFF/" /etc/limine-entry-tool.d/resume.conf /etc/default/limine
 ```
 
-`/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` (plain power-off after the image is written, instead of ACPI S4):
+`/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` (plain power-off after the image is written, instead of ACPI S4; hibernate after 30 minutes of suspend):
 
 ```ini
 [Sleep]
 HibernateMode=shutdown
+HibernateDelaySec=30min
+```
+
+`/etc/systemd/logind.conf.d/30-mac-lid-hibernate.conf` (lid close suspends, then hibernates after the delay above):
+
+```ini
+[Login]
+HandleLidSwitch=suspend-then-hibernate
 ```
 
 `/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` (hibernate at 5 % battery while awake):
@@ -351,6 +359,7 @@ CriticalPowerAction=Hibernate
 
 ```bash
 sudo systemctl restart upower
+sudo systemctl kill -s HUP systemd-logind
 sudo limine-update
 sudo reboot
 ```
@@ -375,5 +384,6 @@ busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login
 swapon --show                                                     # PRIO 0
 sudo btrfs inspect-internal map-swapfile -r /swap/swapfile        # equals resume_offset in /proc/cmdline
 cat /sys/power/disk                                               # [shutdown]
+busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch   # s "suspend-then-hibernate"
 upower -d | grep critical-action                                  # Hibernate
 ```
