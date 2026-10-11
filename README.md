@@ -1,86 +1,32 @@
-# MacBookPro12,1 — built-in keyboard & trackpad on Omarchy (applespi fix)
+# MacBookPro12,1 on Omarchy: built-in keyboard, trackpad, suspend, hibernation
 
-Reference for the 13" Early 2015 MacBook Pro (`MacBookPro12,1`). Omarchy 4.x, kernel `linux-omarchy` 7.x, systemd 261, Limine + LUKS + btrfs, busybox initramfs. Covers keyboard/trackpad, LUKS prompt, suspend and hibernation. State as of 11 Oct 2026.
+For the 13" Early 2015 MacBook Pro (`MacBookPro12,1`) on Omarchy 4.x (kernel `linux-omarchy` 7.x, Limine, LUKS, btrfs, busybox initramfs).
 
----
+The keyboard and trackpad are dead out of the box: the firmware puts the topcase in USB mode, the USB path does not work on this model, and the SPI path hangs on the Broadwell DMA engine. The fix is to run SPI in PIO mode, switch the topcase to SPI at every boot (also in the initramfs, for the LUKS prompt) and reload the drivers around sleep.
 
-## 0. Quick start — `mbp12-omarchy-fix.sh`
+## Automated
 
-Everything in this document is automated by `mbp12-omarchy-fix.sh` (next to this file). It is idempotent (unchanged files are skipped), verifies after each step, stops at the first failure, and backs up every system file it changes to `/root/mbp12-fix-backups/<timestamp>/` (files under `$HOME` get a `.bak.<timestamp>` copy). Run it as your normal user — it calls `sudo` itself; the AUR helper refuses to run as root. The sections below are the manual equivalent and the explanation of *why*.
+`mbp12-omarchy-fix.sh` does everything below. Run it as your normal user; it calls `sudo` itself, skips unchanged files and backs up what it changes to `/root/mbp12-fix-backups/<timestamp>/`.
 
 ```bash
-./mbp12-omarchy-fix.sh --dry-run            # show what would be written/run, change nothing
-./mbp12-omarchy-fix.sh                      # all non-destructive phases (everything except hibernation)
-sudo reboot                                 # keep a USB keyboard attached for this first reboot
-./mbp12-omarchy-fix.sh --verify             # read-only checks; run after every reboot / change
+./mbp12-omarchy-fix.sh --dry-run     # show what would change
+./mbp12-omarchy-fix.sh               # steps 1-5
+sudo reboot                          # keep a USB keyboard attached for this first reboot
+./mbp12-omarchy-fix.sh --verify      # read-only checks
 
-sudo omarchy-hibernation-setup              # optional: hibernation (opt-in, recreates the swapfile)
+sudo omarchy-hibernation-setup       # optional, step 6: hibernation (recreates the swapfile)
 ./mbp12-omarchy-fix.sh --phase hibernation [--yes] [--swap-size 18g]
 ```
 
-| Phase (`--phase <name>`) | Does | Section |
-|---|---|---|
-| `kernel-params` | `initcall_blacklist=dw_pci_driver_init mem_sleep_default=s2idle` in `/etc/default/limine`, rebuild | 3 |
-| `acpi-call` | kernel headers + `acpi_call-dkms` (AUR) | 4.1 |
-| `switch` | `/usr/local/bin/applespi-force` + `applespi-force.service` | 4.3–4.4 |
-| `initramfs` | early hook so the keyboard works at the LUKS prompt, rebuild | 5 |
-| `sleep` | s2idle drop-in, sleep hook, `shell-refresh-on-resume` user script + unit | 6 |
-| `hibernation` | **opt-in, destructive for the swapfile:** move it to a top-level `@swap` subvolume, fix `resume_offset` | 7 |
-| `shutdown-trace` | **opt-in, diagnostic:** system-shutdown hook that saves lid state + kernel log tail to `/var/lib/mbp12-shutdown-trace/` right before the final power-off, for a machine that does not stay off; `--remove` uninstalls it | 7.5 |
-| `verify` | same as `--verify` | — |
+`--phase <name>` runs one step: `kernel-params`, `acpi-call`, `switch`, `initramfs`, `sleep`, `hibernation`, `verify`.
 
-Other flags: `--force-model` skips the `MacBookPro12,1` check (e.g. to try it on a MacBook8,1), `--help` prints the usage header.
+## Manual steps
 
-After changing the sleep hook or the user unit, `./mbp12-omarchy-fix.sh --phase sleep` re-installs just those files (no reboot needed); then `--verify`.
+### 1. Kernel parameters
 
----
+`initcall_blacklist=dw_pci_driver_init` makes the SPI controller use PIO; `mem_sleep_default=s2idle` because S3 sleep wedges the topcase until reboot.
 
-## 1. Root cause
-
-The topcase (keyboard + trackpad) can be driven over **USB or SPI**; ACPI methods select the interface:
-
-| Method | Meaning |
-|---|---|
-| `UIST` | USB Interface Status (1 = USB enabled) |
-| `UIEN n` | USB Interface Enable (0 = off, 1 = on) |
-| `SIST` | SPI Interface Status |
-| `SIEN n` | SPI Interface Enable (1 = on, disables USB) |
-
-The kernel `applespi` driver checks `UIST` at probe; if USB is enabled it backs off (`applespi: USB interface already enabled`) and leaves the device to `usbhid`. On this unit the USB path is electrically dead (`usb 1-5: device descriptor read/64, error -71`, `Device not responding to setup address`), so no driver ever gets the keyboard. macOS never noticed because it uses SPI on this model.
-
-Forcing SPI mode exposes a second, platform-wide bug: the Broadwell LPSS DMA engine (`00:15.0`, `dw_dmac_pci`) never completes SPI transfers, so `applespi` logs `SPI transfer timed out` / `Error reading from device: -110` forever.
-
-**Fix = three parts**
-
-1. Kernel parameter `initcall_blacklist=dw_pci_driver_init` → GSPI controller (`00:15.4`) falls back to PIO.
-2. At every boot: `UIEN 0`, `SIEN 1` via `acpi_call`, then (re)load `applespi`.
-3. Do part 2 in the initramfs too (LUKS passphrase prompt) and around suspend/resume.
-
-Constants: ACPI path `\_SB_.PCI0.SPI1.SPIT` (from `/sys/bus/spi/devices/spi-APP000D:00/firmware_node/path`), ACPI device `APP000D`.
-
----
-
-## 2. Diagnosis commands
-
-```bash
-cat /sys/class/dmi/id/product_name                          # MacBookPro12,1
-sudo dmesg | grep -iE "applespi|PIO|dw_dmac|spi1"
-sudo dmesg | grep -iE "usb 1-|hid|bcm5974"                   # usb 1-5 error -71 = dead USB path
-lsusb | grep -i apple                                        # needs: sudo pacman -Sy usbutils
-sudo libinput list-devices | grep -iA3 apple
-cat /sys/bus/spi/devices/spi-APP000D:00/firmware_node/path   # ACPI path for the script/hook
-lspci -nn | grep -E "15\.0|15\.4"                            # LPSS DMA + GSPI controllers
-```
-
----
-
-## 3. Part 1 — kernel parameters
-
-```bash
-sudo nano /etc/default/limine
-```
-
-Append (leave existing `KERNEL_CMDLINE[default]=` lines untouched):
+Append to `/etc/default/limine`:
 
 ```
 KERNEL_CMDLINE[default]+=" initcall_blacklist=dw_pci_driver_init mem_sleep_default=s2idle"
@@ -88,34 +34,20 @@ KERNEL_CMDLINE[default]+=" initcall_blacklist=dw_pci_driver_init mem_sleep_defau
 
 ```bash
 sudo limine-update
-sudo reboot
-grep -oE "initcall_blacklist=[^ ]*|mem_sleep_default=[^ ]*" /proc/cmdline
-sudo dmesg | grep -i PIO        # pxa2xx_spi_pci 0000:00:15.4: no DMA channels available, using PIO
 ```
 
----
+### 2. acpi_call
 
-## 4. Part 2 — acpi_call + switch script + systemd unit
-
-### 4.1 acpi_call (DKMS)
+Needed to call the ACPI methods that switch the topcase to SPI.
 
 ```bash
-sudo pacman -S --needed dkms base-devel linux-omarchy-headers   # linux-headers for plain -arch kernel
+sudo pacman -S --needed dkms base-devel linux-omarchy-headers
 yay -S acpi_call-dkms
-sudo modprobe acpi_call
 ```
 
-### 4.2 Manual test
+### 3. Switch to SPI at boot
 
-```bash
-P=$(cat /sys/bus/spi/devices/spi-APP000D:00/firmware_node/path)
-echo "$P.UIEN 0" | sudo tee /proc/acpi/call
-echo "$P.SIEN 1" | sudo tee /proc/acpi/call
-sudo modprobe -r applespi && sudo modprobe applespi
-sudo dmesg | grep -i applespi | tail -3        # → modeswitch done.
-```
-
-### 4.3 Script — `/usr/local/bin/applespi-force`
+`/usr/local/bin/applespi-force` (mode 755):
 
 ```sh
 #!/bin/sh
@@ -127,11 +59,7 @@ modprobe -r applespi
 modprobe applespi
 ```
 
-```bash
-sudo chmod 755 /usr/local/bin/applespi-force     # missing this → status=203/EXEC
-```
-
-### 4.4 Unit — `/etc/systemd/system/applespi-force.service`
+`/etc/systemd/system/applespi-force.service`:
 
 ```ini
 [Unit]
@@ -150,17 +78,15 @@ WantedBy=sysinit.target
 ```
 
 ```bash
+sudo chmod 755 /usr/local/bin/applespi-force
 sudo systemctl enable --now applespi-force.service
-systemctl status applespi-force.service --no-pager     # active (exited), status=0/SUCCESS
 ```
 
----
+### 4. Initramfs hook (keyboard at the LUKS prompt)
 
-## 5. Part 3a — initramfs hook (keyboard at the LUKS prompt)
+The hook does the same switch before the passphrase prompt, retries up to 3 times, and powers the machine off if the disk is not unlocked within 10 minutes.
 
-Omarchy's `/etc/mkinitcpio.conf.d/omarchy_hooks.conf` **replaces** `HOOKS` with a busybox set (`base udev plymouth … encrypt …`); the `systemd`/`sd-vconsole` line in `/etc/mkinitcpio.conf` is inert. Therefore: busybox-style `run_earlyhook`, and a drop-in named to sort *after* `omarchy_hooks.conf`.
-
-### 5.1 `/etc/initcpio/install/applespi-force`
+`/etc/initcpio/install/applespi-force`:
 
 ```bash
 #!/bin/bash
@@ -177,7 +103,7 @@ help() {
 }
 ```
 
-### 5.2 `/etc/initcpio/hooks/applespi-force`
+`/etc/initcpio/hooks/applespi-force`:
 
 ```sh
 #!/usr/bin/ash
@@ -246,80 +172,30 @@ run_cleanuphook() {
 }
 ```
 
-`run_earlyhook` runs for every hook before any `run_hook`; the `encrypt` passphrase prompt is a `run_hook`, so ordering in HOOKS doesn't matter.
-
-What it does on top of the plain switch (added 3 Oct 2026, after the incident in 5.5):
-
-- **Liveness check + retry.** `Apple SPI Touchpad` is only registered once the topcase has answered over SPI (on a cold boot < 1 ms after `modprobe applespi`), so its presence in `/sys/class/input/*/name` is the test. Not there within 3 s → redo `UIEN 0`/`SIEN 1` + driver reload, up to 3 attempts (worst case ~12 s, only on failure). After that, boot continues (USB keyboard still works).
-- **LUKS watchdog.** Root (`$root`, i.e. `/dev/mapper/root`) not unlocked within 600 s → `poweroff -f`. The initramfs has no lid handling, so without this a dead keyboard or a self-wake (7.5) sits at the prompt until the battery is empty. Nothing is mounted at that point, so a pending hibernation image is untouched and the next boot still resumes. The watchdog exits by itself once root is unlocked; `run_cleanuphook` kills it before `switch_root` as a safety net.
-- **Logging** via `/dev/kmsg`: `sudo journalctl -k -b | grep applespi-force:` → `topcase up (attempt 1)` normally. Cold boots only (a resume replaces this kernel's log with the image's). `--verify` checks it and warns when retries were needed. (With `-o cat` journald drops the `applespi-force:` prefix — it becomes `SYSLOG_IDENTIFIER` — so `--verify` fetches those lines by identifier.) First seen in action on the first boot with this hook: `no answer from topcase (attempt 1 of 3)` → `topcase up (attempt 2)`.
-
-- **USB port off before `UIEN 0`** (added 3 Oct 2026). Symptom: ~15 s of black screen between Limine and the LUKS prompt on most boots and resumes. Cause: xhci is built in and starts enumerating the dead `usb 1-5` at ~1.0 s, exactly when the hook runs. `UIEN 0` in the middle of a descriptor read makes the device vanish without a disconnect event, the hub sits out 3 × `usbcore.initial_descriptor_timeout` (5 s), and `udevadm settle` in the `udev` hook - which runs before `plymouth` and `encrypt` - waits for it. In the kernel log: `usb 1-5: new full-speed USB device`, then nothing between `fb0: i915drmfb` (~2.5 s) and `device-mapper: ioctl` (~18 s; `encrypt` loads dm-crypt before it prompts). Boots where the hook won the race (no `usb 1-5` line at all) had the prompt 0.3 s after the display. Fix: write `1` to the port's `early_stop` and `disable` first; the `disable` write takes the hub lock, so it returns only after the running enumeration attempt has failed (fast, the device still answers with `-71`), and the port stays off. If the topcase then does not answer, the port is powered back on before the retry. `--verify` times display → prompt and fails above 5 s.
-
-### 5.3 `/etc/mkinitcpio.conf.d/zz-applespi-force.conf`
+`/etc/mkinitcpio.conf.d/zz-applespi-force.conf` (the name must sort after `omarchy_hooks.conf`):
 
 ```
 HOOKS+=(applespi-force)
 ```
 
-### 5.4 Rebuild
-
 ```bash
-sudo mkinitcpio -P 2>&1 | grep -E "Running build hook|applespi|acpi_call|ERROR|WARNING"
-#   must show: -> Running build hook: [applespi-force]
+sudo mkinitcpio -P      # must show: -> Running build hook: [applespi-force]
 sudo limine-update
 sudo reboot
-sudo dmesg | grep -iE "acpi_call|modeswitch"     # both at ~1–3 s, not ~12 s
 ```
 
-### 5.5 Incident 23 Sep – 3 Oct 2026: keyboard dead at the LUKS prompt after hibernate
+### 5. Suspend and resume
 
-Hibernated at 77 % (23 Sep 09:50). On the next power-on the built-in keyboard did not react at the LUKS prompt; the machine was left alone for days. On 3 Oct it booted normally and resumed fine, but at 1.3 %. A hibernated (off) Mac does not use ~49 Wh in 10 days → it sat powered on at the LUKS prompt for hours. The failed boot itself left no log (never got past LUKS → nothing written to the journal; a successful resume replaces the early-boot kernel log). Config and initramfs were unchanged and `applespi` had never logged an error → one-off failure in the early hook, not a broken setup. Response: retry + watchdog + logging in 5.2. If it happens without the watchdog: hold power to force off and cold-boot again, don't close the lid on the prompt.
-
----
-
-## 6. Part 3b — suspend / resume
-
-Deep (S3) sleep wedges the SPI device until reboot; s2idle works.
-
-### 6.1 `/etc/systemd/sleep.conf.d/mac-s2idle.conf`
+`/etc/systemd/sleep.conf.d/mac-s2idle.conf`:
 
 ```ini
 [Sleep]
 MemorySleepMode=s2idle
 ```
 
-(`mem_sleep_default=s2idle` on the kernel cmdline is set in section 3.) Verify: `cat /sys/power/mem_sleep` → `[s2idle] deep`.
+The sleep hook unloads `applespi` and `brcmfmac` before sleep. After resume it reloads `applespi` and revives Wi-Fi in a detached unit: remove the card, rescan, reload `brcmfmac`. It must remove only the card, never the PCIe root port above it (`00:1c.2`), or the machine no longer stays off at the next power-off.
 
-### 6.2 Sleep hook + shell-restart user unit
-
-Constraints the hook is built around:
-
-1. `applespi` wedges across sleep → unload in `pre`, reload in `post`.
-2. `brcmfmac` refuses to enter D3 (`-5`), which aborts the suspend and makes systemd retry in a loop (lid logo blinks every few seconds) → unload in `pre`.
-3. After hibernate the BCM43602 comes back dead. A driver reload is not enough: the card (`03:00.0`, found via PCI class `0x028000`) must be removed and rescanned. Remove only the card, not the PCIe root port above it (`00:1c.2`): after a root-port remove the machine no longer stays off at the next power-off (7.5). NetworkManager then sees a hot-plug and reconnects on its own.
-4. Restarting NetworkManager breaks the Omarchy shell's network widget (Quickshell's `Quickshell.Networking` D-Bus model does not re-attach; the bar shows "NOT CONNECTED" while `nmcli` is connected). The only repair is `omarchy-restart-shell`, which flickers the screen and refuses to run while the session is locked → restart NM + shell only as a fallback, and only after the unlock.
-5. systemd keeps `user.slice`, including the lock screen, frozen until every sleep hook has returned → `post` does nothing slow; the Wi-Fi recovery runs detached via `systemd-run` (a `&` background job would be killed with `systemd-sleep`).
-6. A lid shut again right after a wake runs `post` → `pre` back to back → `pre` stops a running Wi-Fi recovery and retries the `brcmfmac` unload (the module is "in use" while its firmware loads).
-7. The shell restart runs as a user unit started with `systemctl --user --machine=<user>@.host`, because the user manager already carries the Hyprland environment. `omarchy-restart-shell`, not `omarchy-refresh-shell` (the latter resets `~/.config/omarchy/shell.json` to defaults first).
-
-Resulting design (three pieces):
-
-```
-systemd-sleep ─post─▶ hook "post":  applespi-force                       keyboard back ~30 ms after resume
-                                    systemd-run --unit=applespi-wifi-resume "$0" wifi-resume   (detached, returns at once)
-              ─thaw user.slice ───▶ lock screen responsive immediately
-
-applespi-wifi-resume.service (root): remove Wi-Fi card → rescan → modprobe brcmfmac → poll for wl* → udevadm settle
-                                     → wait ≤ 8 s for NM to report the Wi-Fi device as usable (not "unavailable")
-                                       ├─ yes (normal): done. NM reconnects itself, bar icon follows. No flicker.
-                                       └─ no (fallback): restart wpa_supplicant NetworkManager
-                                                         → systemctl --user --machine=<user>@.host start shell-refresh-on-resume.service
-
-shell-refresh-on-resume.service (user, fallback only): wait until unlocked (poll 0.2 s) → omarchy-restart-shell
-```
-
-**`/usr/lib/systemd/system-sleep/applespi`** (mode 755; systemd has no `/etc` equivalent for this directory):
+`/usr/lib/systemd/system-sleep/applespi` (mode 755):
 
 ```sh
 #!/bin/sh
@@ -390,7 +266,9 @@ case "$1" in
 esac
 ```
 
-**`~/.local/bin/shell-refresh-on-resume`** (mode 755):
+If NetworkManager has to be restarted, the Omarchy shell's network widget loses it, so the hook starts this user unit, which restarts the shell once the session is unlocked.
+
+`~/.local/bin/shell-refresh-on-resume` (mode 755):
 
 ```bash
 #!/bin/bash
@@ -406,7 +284,7 @@ while omarchy-hyprland-session-locked; do sleep 0.2; done
 exec omarchy-restart-shell
 ```
 
-**`~/.config/systemd/user/shell-refresh-on-resume.service`** (static, started by the hook; no `[Install]`):
+`~/.config/systemd/user/shell-refresh-on-resume.service`:
 
 ```ini
 [Unit]
@@ -421,50 +299,14 @@ ExecStart=%h/.local/bin/shell-refresh-on-resume
 sudo chmod 755 /usr/lib/systemd/system-sleep/applespi
 chmod 755 ~/.local/bin/shell-refresh-on-resume
 systemctl --user daemon-reload
-systemctl suspend      # wake → keyboard works at once on the lock screen; Wi-Fi reconnects by itself within a few seconds
-systemctl hibernate    # resume → same
 ```
 
-Logs:
+### 6. Hibernation (optional)
+
+`omarchy-hibernation-setup` puts the swapfile in a subvolume nested under `@`, which systemd 259 and later refuses to hibernate into. Move it to a top-level `@swap` subvolume. This deletes and recreates the swapfile.
 
 ```bash
-sudo journalctl -b -o short-monotonic | grep -iE "PM: |brcmfmac|Failed to put" | tail -15   # good: one "suspend entry (s2idle)" → "suspend exit", no "returns -5"
-sudo journalctl -b -u applespi-wifi-resume              # which path the Wi-Fi recovery took ("no restart needed" = normal)
-journalctl -b --user-unit shell-refresh-on-resume       # shell restart (fallback only)
-sudo journalctl -b -t systemd-sleep                     # hook errors
-```
-
-Tunable: `sleep 1` after removing the card. If Wi-Fi ever stays dead after hibernate, raise it to `sleep 2`; it only delays Wi-Fi, not input.
-
-Manual Wi-Fi recovery (same steps as the hook, including the shell restart): `sudo /usr/lib/systemd/system-sleep/applespi wifi-resume`.
-
-Diagnosing sleep problems: `cat /proc/acpi/wakeup` (ACPI wake devices), `sudo cat /sys/kernel/debug/wakeup_sources` (event counts), and the journal grep above. `Some devices failed to suspend` / `Failed to put system to sleep` means a device refusing to suspend, not a wake source.
-
-Lid close is a plain suspend, the logind default; no drop-in under `/etc/systemd/logind.conf.d/` sets `HandleLidSwitch`. Verify: `busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch` → `s "suspend"`.
-
-Trade-off: s2idle drains ~10 %/day closed, and nothing watches the battery while suspended, so shut down for long stretches. Hibernation (section 7) is only the low-battery action while awake (7.6), not a routine sleep state.
-
----
-
-## 7. Hibernation (btrfs swapfile on a top-level `@swap` subvolume)
-
-Omarchy's `omarchy-hibernation-setup` creates the swapfile in a subvolume **nested under `@`** (`@/swap`). systemd ≥ 259 refuses to hibernate into that (`CanHibernate` reports unavailable, `systemctl hibernate` silently does nothing). Fix: move it to a top-level `@swap` subvolume mounted at `/swap` (same layout as Omarchy PR #12176).
-
-### 7.1 Diagnose
-
-```bash
-busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate   # want: s "yes"
-# NOTE: `systemctl show -p CanHibernate` prints nothing either way — it is a logind property, not a PID-1 one.
-swapon --show                                          # PRIO must be >= 0 (negative priority swap is ignored for hibernation)
-sudo btrfs subvolume list / | grep -i swap             # want: "top level 5 path @swap"; "top level 256 path swap" = nested (bad)
-findmnt /swap                                          # want: subvol=/@swap
-grep -oE "resume=[^ ]*|resume_offset=[^ ]*" /proc/cmdline
-sudo btrfs inspect-internal map-swapfile -r /swap/swapfile   # must equal resume_offset
-```
-
-### 7.2 Move the swapfile to a top-level subvolume
-
-```bash
+sudo omarchy-hibernation-setup
 sudo swapoff /swap/swapfile
 sudo mkdir -p /mnt/top
 sudo mount -t btrfs -o subvolid=5 /dev/mapper/root /mnt/top
@@ -475,7 +317,7 @@ sudo umount /mnt/top
 sudo mkdir -p /swap
 ```
 
-`sudo nano /etc/fstab` — mount line **above** the swapfile line:
+In `/etc/fstab`, with the mount line above the swapfile line:
 
 ```
 /dev/mapper/root  /swap  btrfs  subvol=@swap,nodatacow,noatime  0 0
@@ -485,130 +327,53 @@ sudo mkdir -p /swap
 ```bash
 sudo systemctl daemon-reload
 sudo mount /swap
-sudo btrfs filesystem mkswapfile --size 18g /swap/swapfile      # RAM (16 GB) + 2 GB headroom
-sudo swapon -a                                                  # via fstab, so it gets pri=0 (a bare `swapon` gives -1)
-OFF=$(sudo btrfs inspect-internal map-swapfile -r /swap/swapfile); echo $OFF
+sudo btrfs filesystem mkswapfile --size 18g /swap/swapfile      # RAM + 2 GB
+sudo swapon -a
+OFF=$(sudo btrfs inspect-internal map-swapfile -r /swap/swapfile)
 sudo sed -i "s/resume_offset=[0-9]*/resume_offset=$OFF/" /etc/limine-entry-tool.d/resume.conf /etc/default/limine
-sudo limine-update
 ```
 
-The `resume` initramfs hook and `resume=/dev/mapper/root resume_offset=…` kernel parameters were already in place from `omarchy-hibernation-setup` (`/etc/mkinitcpio.conf.d/omarchy_resume.conf`, `/etc/limine-entry-tool.d/resume.conf`).
-
-### 7.3 Test and read the log correctly
-
-```bash
-systemctl hibernate        # machine powers off; power button → LUKS prompt (built-in keyboard works) → session restored
-sudo journalctl -b -o short-iso --no-pager | grep -iE "hibernation entry|hibernation exit" | tail -2
-```
-
-A resumed system keeps the same boot ID, and its journal is the snapshot taken *before* the image was written: `journalctl -b -1` is empty and there are no "Image saving/restored" lines. Success = a wall-clock gap of tens of seconds between `hibernation entry` and `hibernation exit` with monotonic time barely moving, then `modeswitch done` and `brcmfmac` re-registering. An abort = ~1 s gap with an error in between.
-
-### 7.4 `HibernateMode=shutdown` (power off instead of ACPI S4)
+`/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` (plain power-off after the image is written, instead of ACPI S4):
 
 ```ini
-# /etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf
 [Sleep]
 HibernateMode=shutdown
 ```
 
-The default (`platform`) enters ACPI S4 after writing the image, which keeps wake sources armed (`/proc/acpi/wakeup`: `LID0` and `ARPT` are S4-capable). `shutdown` does a plain power-off after the image is written. Verify: `cat /sys/power/disk` → `[shutdown]`. Takes effect on the next sleep (`systemd-sleep` reads the config each time). The installer's `hibernation` phase writes this file.
-
-### 7.5 Mac does not stay off after a power-off → card-only remove in the sleep hook
-
-Symptom: after `systemctl poweroff` or a hibernate from a session that had resumed from sleep at least once, the machine either restarts itself 30-50 s later and sits at the LUKS prompt (Apple logo lit with the lid shut), or stays dark but powered: warm, short presses of the power button do nothing, a 5-6 s hold followed by a normal press boots it. Sessions that never slept power off properly.
-
-Cause: until 11 Oct 2026 the sleep hook revived Wi-Fi on resume by removing the PCIe root port above the card (`00:1c.2`) and rescanning. After that remove the kernel still runs the whole shutdown and reaches `reboot: Power down`, but the machine does not go down. Why the firmware reacts that way is not known. Ruled out by test: ACPI wake sources (all disabled, same result), the `applespi` and `brcmfmac` reloads, and the sleep itself (the hook's Wi-Fi part run by hand on a fresh boot reproduces it). An SMC reset (22 Sept 2026) did not cure it.
-
-**Fix: remove only the card** (6.2; `./mbp12-omarchy-fix.sh --phase sleep` installs the current hook). Watched power-offs on 11 Oct 2026: 6 of 6 failed with the root-port remove, 3 of 3 were proper with the card-only remove, two of those after a real suspend. Wi-Fi came back after suspend and after one hibernate cycle. A hibernate from a session with earlier suspends has not been re-tested.
-
-```bash
-grep -c 'port/remove' /usr/lib/systemd/system-sleep/applespi   # want: 0 (also checked by --verify)
-lspci -vs 00:1c.2 | grep 'Memory behind'                       # c1000000-c14fffff = port untouched since boot;
-                                                               # 90000000-904fffff = it was removed, power-off will fail
-```
-
-To test a cycle: close the lid for a minute, open it, `systemctl poweroff` (or `sudo systemctl hibernate`), touch nothing for 2 minutes and watch. Back at the LUKS prompt by itself, or a single short press does not boot it = failure. The power-off is never logged (see 7.3), so only watched cycles count; `--phase shutdown-trace` saves the last kernel lines of each shutdown, and `mbp-hib-report` (`~/.local/bin`) lists the hibernate cycles of the current boot with their entry→resume gap.
-
-Lid close stays a plain suspend (section 6); hibernate remains the low-battery action while awake (7.6).
-
-### 7.6 Battery empty while awake: hibernate
+`/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` (hibernate at 5 % battery while awake):
 
 ```ini
-# /etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf
 [UPower]
 PercentageCritical=10.0
 PercentageAction=5.0
 CriticalPowerAction=Hibernate
 ```
 
-UPower acts when the battery reaches `PercentageAction`; 5 % instead of the default 2 % leaves an aged battery enough charge to write the image. UPower requires `PercentageLow` > `PercentageCritical` > `PercentageAction` and silently falls back to its defaults (20/5/2) otherwise, hence `PercentageCritical=10`. Its default action `Auto` prefers HybridSleep, which writes the image but then stays in s2idle on an empty battery; `Hibernate` powers off after the write (7.4). Drop-in names must match `NN-name.conf` or UPower ignores them. `sudo systemctl restart upower`, then verify: `upower -d | grep critical-action` → `Hibernate`. The installer's `hibernation` phase writes this file.
+```bash
+sudo systemctl restart upower
+sudo limine-update
+sudo reboot
+```
 
-This only covers a running machine. In s2idle nothing watches the battery: a suspended machine left long enough runs flat and the session is lost.
+## Verify
 
----
+`./mbp12-omarchy-fix.sh --verify` runs these and more.
 
-## 8. Files touched (summary)
+```bash
+grep -oE "initcall_blacklist=[^ ]*|mem_sleep_default=[^ ]*" /proc/cmdline
+sudo journalctl -k -b | grep -E "using PIO|modeswitch done|applespi-force:"   # want: "topcase up (attempt 1)"
+systemctl is-active applespi-force.service
+cat /sys/power/mem_sleep                                          # [s2idle] deep
+grep -c 'port/remove' /usr/lib/systemd/system-sleep/applespi      # 0
+sudo journalctl -b -u applespi-wifi-resume                        # after a resume: "no restart needed"
+```
 
-| File | Purpose |
-|---|---|
-| `/etc/default/limine` | `initcall_blacklist=dw_pci_driver_init mem_sleep_default=s2idle` |
-| `/usr/local/bin/applespi-force` | UIEN 0 / SIEN 1 / reload applespi |
-| `/etc/systemd/system/applespi-force.service` | runs the script at boot (main system) |
-| `/etc/initcpio/install/applespi-force` | adds modules + runscript to initramfs |
-| `/etc/initcpio/hooks/applespi-force` | early hook: switch to SPI before LUKS prompt (verified, 3 tries), 10-min LUKS power-off watchdog |
-| `/etc/mkinitcpio.conf.d/zz-applespi-force.conf` | `HOOKS+=(applespi-force)` |
-| `/etc/systemd/sleep.conf.d/mac-s2idle.conf` | force s2idle |
-| `/etc/systemd/sleep.conf.d/mac-hibernate-shutdown.conf` | `HibernateMode=shutdown`: plain power-off after hibernate instead of ACPI S4 (7.4) |
-| `/etc/UPower/UPower.conf.d/60-mac-critical-hibernate.conf` | `CriticalPowerAction=Hibernate`, `PercentageAction=5`: hibernate at 5 % while awake (7.6) |
-| `/usr/lib/systemd/system-sleep/applespi` | `pre`: detach `applespi` + `brcmfmac`; `post`: reattach `applespi`, spawn detached `applespi-wifi-resume` unit (Wi-Fi card remove/rescan; only if NM doesn't recover: restart supplicant/NM + trigger the user unit) |
-| `~/.local/bin/shell-refresh-on-resume` | fallback only: wait for unlock, then `omarchy-restart-shell` |
-| `~/.config/systemd/user/shell-refresh-on-resume.service` | user unit wrapping the script; started by the hook via `systemctl --user --machine=` |
-| `/etc/fstab` | `@swap` subvolume mounted at `/swap` + swapfile with `pri=0` |
-| `/etc/limine-entry-tool.d/resume.conf` | `resume=/dev/mapper/root resume_offset=<from map-swapfile>` (written by Omarchy, offset updated) |
+Hibernation only:
 
----
-
-## 9. Maintenance & quirks
-
-- `acpi_call` is DKMS: rebuilds on kernel updates as long as `linux-omarchy-headers` stays installed. Check `sudo dkms status`, `ls /lib/modules/$(uname -r)/updates/dkms/`.
-- `mkinitcpio -P` runs on kernel updates and picks the hook up automatically.
-- If the ACPI path ever changes, re-read `firmware_node/path` and update the script (4.3) and hook (5.2).
-- Harmless dmesg: `Unknown touchpad model 3 – falling back to MB8 touchpad` (no geometry table for the 12,1); one `crc mismatch` during the mode switch.
-- Trackpad tuning: Super + Space → Setup → Input, or `omarchy-trackpad-plus`.
-- The `rfkill`/`iw` PHY index (`phy0` → `phy3`…) climbs by one on every resume because the card is re-enumerated; harmless.
-- The bar is Quickshell (`quickshell -p /usr/share/omarchy/shell`); `omarchy-restart-shell` restarts it (refuses while locked). `omarchy-refresh-shell` also resets `~/.config/omarchy/shell.json` to defaults; don't automate that one.
-- The `dmesg | grep` checks in sections 3–5 only work shortly after boot (ring buffer). Later use `sudo journalctl -k -b | grep …`; early-boot lines there all carry the journald start time, so judge the initramfs hook by order (`acpi_call: loading` before `BTRFS info … first mount`), which is what `--verify` does.
-- `journalctl` for system units needs `sudo`; `/boot` is root-only; the UKI is an `.efi`, readable with `lsinitcpio`.
-
----
-
-## 10. Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `applespi: USB interface already enabled` | firmware set USB mode | run/enable `applespi-force.service` |
-| `usb 1-5: … error -71` | dead USB path on topcase | expected; use SPI mode |
-| `applespi: SPI transfer timed out` / `-110` | LPSS DMA bug | `initcall_blacklist=dw_pci_driver_init` |
-| unit `status=203/EXEC` "Permission denied" | script not executable | `chmod 755 /usr/local/bin/applespi-force` |
-| keyboard dead at LUKS prompt, machine left on drains battery | early hook switch did not take (one-off) | hook retries 3× and powers off after 10 min unlocked (5.2); check `journalctl -k -b \| grep applespi-force:` |
-| `acpi_call` first loads at ~12 s, keyboard dead at LUKS | hook not in initramfs (drop-in clobbered) | `zz-` drop-in name, rebuild, check for build-hook line |
-| keyboard dead after wake | S3 sleep or driver not reattached | s2idle + sleep hook; `sudo systemctl restart applespi-force` |
-| lid closed → logo lights up every few seconds | `brcmfmac` fails D3 (`-5`), suspend aborts, systemd retries | unload/reload `brcmfmac` in the sleep hook (6.2) |
-| Wi-Fi dead after hibernate: `wpa_supplicant: Failed to initialize driver interface`, NM `unavailable` then "giving up" | card not really reset by driver reload | card remove/rescan + restart `wpa_supplicant NetworkManager` (6.2) |
-| bar shows "NOT CONNECTED" but `nmcli` connected | Quickshell network widget lost NetworkManager when it was restarted | `omarchy-restart-shell` (automated as fallback, 6.2); check `sudo journalctl -b -u applespi-wifi-resume` |
-| `modprobe: FATAL: Module brcmfmac is in use` when the lid is shut again right after a wake | `post` → `pre` back-to-back, driver still loading firmware | `pre` stops `applespi-wifi-resume` and retries the unload (6.2) |
-| `CanHibernate` = "na"/empty, `systemctl hibernate` does nothing | swapfile on nested `@/swap` subvolume, or swap PRIO < 0 | top-level `@swap` (7.2); activate swap via fstab |
-| after a shutdown or hibernate the Mac restarts itself within a minute (LUKS prompt, Apple logo lit), or stays dark but warm and needs a 5-6 s hold of the power button | an old sleep hook removed the Wi-Fi PCIe root port `00:1c.2` on resume; the next power-off then does not take the machine down | `--phase sleep` installs the card-only hook (7.5); `--verify` checks it |
-| lid close hibernates instead of suspending | leftover `HandleLidSwitch=` drop-in in `/etc/systemd/logind.conf.d/` | remove it, reboot; `--verify` checks this |
-| `resume_offset` wrong after recreating swapfile | offset not recomputed | `btrfs inspect-internal map-swapfile -r`, update resume.conf, `limine-update` |
-
----
-
-## 11. Sources
-
-- Omarchy manual, Mac support — `omarchy.org/manual/mac-support/`
-- Omarchy issue #1954 (MacBook8,1 applespi timeouts, DMA root cause) · PR #9735 (PIO switch for 8,1)
-- `openwebcraft.com/archive/2026/omarchy-4-on-12-macbook8-1` · `gist.github.com/matthiasjg/78aaf7802146f0b89be3da9e4feb111f`
-- Kernel `drivers/input/keyboard/applespi.c` (UIEN/UIST/SIEN/SIST)
-
-Worth reporting in issue #1954: the 12,1 needs the PIO fix **and** a forced `SIEN` (dead USB path), so it can be added to the installer's automatic Mac fixes.
+```bash
+busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate   # s "yes"
+swapon --show                                                     # PRIO 0
+sudo btrfs inspect-internal map-swapfile -r /swap/swapfile        # equals resume_offset in /proc/cmdline
+cat /sys/power/disk                                               # [shutdown]
+upower -d | grep critical-action                                  # Hibernate
+```
